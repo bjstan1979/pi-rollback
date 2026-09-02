@@ -22,6 +22,8 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 /redo
 ```
 
+For the slash command, a numeric target counts checkpoints, not whole agent runs. Use an explicit label such as `rollback-before-1-0` when you want a specific run boundary.
+
 Pi also exposes an LLM-callable `rollback` tool. Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued. Automatic checkpoints are captured before and after each model turn.
 
 ### Extension integration
@@ -36,7 +38,9 @@ Completion is persisted as a `pi-rollback-result` session entry and emitted on t
 
 ### Redo
 
-`/redo` reverses the most recent rollback: it restores each mutation's `after` state and navigates back to the exact pre-rollback session leaf, making that branch's checkpoints active again. Redo is single-level and is refused if the rollback branch or covered files changed, so it cannot overwrite new work.
+`/redo` reverses the most recent rollback: it restores each mutation's `after` state and navigates back to the exact pre-rollback session leaf, making that branch's checkpoints active again.
+
+Rollback never deletes later checkpoints; they remain on the original inactive branch. Redo returns to that branch, so its checkpoints appear in `/checkpoints` again. Redo is single-level and is refused if the rollback branch or covered files changed, preventing it from overwriting new work.
 
 ## Tracking modes
 
