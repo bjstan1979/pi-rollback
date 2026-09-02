@@ -19,6 +19,8 @@ import {
 
 const CHECKPOINT_TYPE = "pi-rollback-checkpoint";
 const MUTATION_TYPE = "pi-rollback-mutation";
+const RESULT_TYPE = "pi-rollback-result";
+export const ROLLBACK_RESULT_EVENT = "pi-rollback:result";
 const SNAPSHOT_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots");
 const VERSION = 2;
 
@@ -58,12 +60,25 @@ interface RootMutation {
   createdAt: number;
 }
 
-interface RollbackArgs {
+export interface RollbackArgs {
   targetLabel?: string;
   targetEntryId?: string;
   count?: number;
+  runCount?: number;
+  requestId?: string;
   continuePrompt?: string;
   summarize?: boolean;
+}
+
+export interface RollbackResult {
+  version: 1;
+  requestId?: string;
+  ok: boolean;
+  targetEntryId?: string;
+  targetLabel?: string;
+  files?: number;
+  error?: string;
+  createdAt: number;
 }
 
 interface SessionEntry {
@@ -219,6 +234,10 @@ function parseArgs(raw: string): RollbackArgs {
 
 function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint {
   const all = checkpoints(ctx);
+  if ((args.targetEntryId || args.targetLabel) && (args.count !== undefined || args.runCount !== undefined)) {
+    throw new Error("Rollback target is ambiguous");
+  }
+  if (args.count !== undefined && args.runCount !== undefined) throw new Error("Rollback target is ambiguous");
   if (args.targetEntryId) {
     const found = all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId);
     if (found) return found;
@@ -228,6 +247,14 @@ function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint 
     const found = all.findLast((checkpoint) => checkpoint.label === args.targetLabel);
     if (found) return found;
     throw new Error(`No active checkpoint labelled ${args.targetLabel}`);
+  }
+  if (args.runCount !== undefined) {
+    const starts = all.filter((checkpoint) => /^rollback-before-\d+-0$/.test(checkpoint.label));
+    const target = starts.length - args.runCount;
+    if (!Number.isInteger(args.runCount) || args.runCount < 1 || target < 0) {
+      throw new Error(`Can roll back at most ${starts.length} agent run(s)`);
+    }
+    return starts[target]!;
   }
   const count = args.count ?? 1;
   const target = all.length - 1 - count;
@@ -365,16 +392,27 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
     }
   });
 
+  const publishRollbackResult = (result: Omit<RollbackResult, "version" | "createdAt">): RollbackResult => {
+    const published: RollbackResult = { ...result, version: 1, createdAt: Date.now() };
+    pi.appendEntry(RESULT_TYPE, published);
+    pi.events.emit(ROLLBACK_RESULT_EVENT, published);
+    return published;
+  };
+
   const runRollback = async (args: RollbackArgs, ctx: ExtensionCommandContext): Promise<void> => {
+    let target: Checkpoint | undefined;
     try {
+      if (args.requestId !== undefined && (!args.requestId.trim() || Buffer.byteLength(args.requestId, "utf8") > 128)) {
+        throw new Error("Rollback requestId must be 1-128 bytes");
+      }
       await ctx.waitForIdle();
       await flushPending(ctx);
       await captureExternalChanges(ctx);
-      const target = findCheckpoint(ctx, args);
+      target = findCheckpoint(ctx, args);
       let files = 0;
       let sandboxBefore: string | undefined;
       const reverted: Mutation[] = [];
-      const selected = mutations(ctx).filter((item) => item.seq > target.seq).sort((a, b) => b.seq - a.seq);
+      const selected = mutations(ctx).filter((item) => item.seq > target!.seq).sort((a, b) => b.seq - a.seq);
       if (sandboxed && target.mode !== "sandbox") throw new Error("Sandbox rollback refuses checkpoints created outside sandbox mode");
 
       if (target.mode === "sandbox") {
@@ -410,12 +448,34 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       if (result.cancelled) {
         if (sandboxBefore && target.sandbox) await restore(pi, target.sandbox.root, sandboxBefore, target.sandbox.storeBase);
         for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+        publishRollbackResult({
+          requestId: args.requestId,
+          ok: false,
+          targetEntryId: target.entryId,
+          targetLabel: target.label,
+          error: "Rollback cancelled",
+        });
         return;
       }
+      publishRollbackResult({
+        requestId: args.requestId,
+        ok: true,
+        targetEntryId: target.entryId,
+        targetLabel: target.label,
+        files,
+      });
       if (args.continuePrompt?.trim()) await pi.sendUserMessage(args.continuePrompt.trim());
       if (ctx.hasUI) ctx.ui.notify(`Restored ${files} file(s) and checkpoint ${target.label}`, "info");
     } catch (error) {
-      if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      const message = error instanceof Error ? error.message : String(error);
+      publishRollbackResult({
+        requestId: args.requestId,
+        ok: false,
+        targetEntryId: target?.entryId,
+        targetLabel: target?.label,
+        error: message,
+      });
+      if (ctx.hasUI) ctx.ui.notify(message, "error");
     }
   };
 

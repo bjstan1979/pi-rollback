@@ -23,6 +23,16 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 
 Pi also exposes an LLM-callable `rollback` tool. Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued. Automatic checkpoints are captured before and after each model turn.
 
+### Extension integration
+
+Other Pi extensions can dispatch a run-relative rollback with a correlation ID:
+
+```text
+/rollback {"runCount":1,"requestId":"control-123","continuePrompt":"Retry from the restored state."}
+```
+
+Completion is persisted as a `pi-rollback-result` session entry and emitted on the shared `pi-rollback:result` event. The result includes `requestId`, `ok`, the resolved `targetEntryId`, restored file count, and an error on failure.
+
 ## Tracking modes
 
 ### Normal Pi

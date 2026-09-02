@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import rollbackExtension, { capture, restore, snapshotDir } from "./index.js";
+import rollbackExtension, { capture, restore, ROLLBACK_RESULT_EVENT, snapshotDir } from "./index.js";
 import { isHcomSandbox, mutationPaths } from "./journal.js";
 
 const cleanup: string[] = [];
@@ -33,8 +33,10 @@ function harness(cwd: string) {
   let navigatedTo: string | undefined;
   const notifications: string[] = [];
   const sentMessages: Array<{ content: string; options: unknown }> = [];
+  const emitted: Array<{ event: string; data: unknown }> = [];
   const pi = {
     exec,
+    events: { emit(event: string, data: unknown) { emitted.push({ event, data }); } },
     on(name: string, handler: (event: any, ctx: any) => Promise<any>) { handlers[name] = handler; },
     registerCommand(name: string, options: { handler: (args: string, ctx: any) => Promise<void> }) { commands[name] = options.handler; },
     registerTool(tool: { name: string }) { tools.push(tool.name); toolDefs[tool.name] = tool; },
@@ -60,7 +62,7 @@ function harness(cwd: string) {
     async navigateTree(target: string) { navigatedTo = target; return { cancelled: false }; },
   };
   rollbackExtension(pi);
-  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, navigatedTo: () => navigatedTo };
+  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo };
 }
 
 test("root snapshot restores files without touching the project git index", async () => {
@@ -177,7 +179,7 @@ test("sandbox detection uses canonical active modes and path filtering", () => {
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, true), []);
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, false), [join(external, "x.txt")]);
 });
-test("target entry rollback crosses intervening automatic turn checkpoints", async () => {
+test("run-count rollback crosses intervening automatic turn checkpoints and publishes a result", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-entry-"));
   cleanup.push(cwd, snapshotDir(cwd));
   const file = join(cwd, "demo.txt");
@@ -192,9 +194,32 @@ test("target entry rollback crosses intervening automatic turn checkpoints", asy
   await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
   await run.handlers.turn_end!({ turnIndex: 1 }, run.ctx);
 
-  await run.commands.rollback!('{"targetEntryId":"message-0"}', run.ctx);
+  await run.commands.rollback!('{"runCount":1,"requestId":"supervisor-request-1"}', run.ctx);
   assert.equal(readFileSync(file, "utf8"), "original\n");
   assert.equal(run.navigatedTo(), "message-0");
+  assert.equal(run.emitted.length, 1);
+  assert.equal(run.emitted[0]!.event, ROLLBACK_RESULT_EVENT);
+  assert.deepEqual(run.emitted[0]!.data, {
+    version: 1,
+    requestId: "supervisor-request-1",
+    ok: true,
+    targetEntryId: "message-0",
+    targetLabel: "rollback-before-1-0",
+    files: 1,
+    createdAt: (run.emitted[0]!.data as { createdAt: number }).createdAt,
+  });
+});
+test("failed requested rollback publishes a machine-readable result", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-result-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+
+  await run.commands.rollback!('{"runCount":1,"requestId":"missing-target"}', run.ctx);
+  const result = run.emitted[0]!.data as { requestId: string; ok: boolean; error: string };
+  assert.equal(result.requestId, "missing-target");
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Can roll back at most 0 agent run/);
+  assert.equal(run.navigatedTo(), undefined);
 });
 
 test("LLM rollback tool dispatches the extension command on the follow-up turn", async () => {
