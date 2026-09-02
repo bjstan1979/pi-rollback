@@ -20,6 +20,7 @@ import {
 const CHECKPOINT_TYPE = "pi-rollback-checkpoint";
 const MUTATION_TYPE = "pi-rollback-mutation";
 const RESULT_TYPE = "pi-rollback-result";
+const REDO_TYPE = "pi-rollback-redo";
 export const ROLLBACK_RESULT_EVENT = "pi-rollback:result";
 const SNAPSHOT_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots");
 const VERSION = 2;
@@ -79,6 +80,24 @@ export interface RollbackResult {
   files?: number;
   error?: string;
   createdAt: number;
+}
+
+interface RedoRecord {
+  version: 1;
+  sourceEntryId: string;
+  targetEntryId: string;
+  targetLabel: string;
+  mode: "normal" | "sandbox";
+  mutations?: Mutation[];
+  fileGuards?: Array<{ path: string; state: FileState }>;
+  rootGuards?: RootState[];
+  sandbox?: { root: string; rollbackTree: string; redoTree: string; storeBase: string };
+  createdAt: number;
+}
+
+interface ActiveRedo {
+  entryId: string;
+  data: RedoRecord;
 }
 
 interface SessionEntry {
@@ -187,6 +206,15 @@ function checkpoints(ctx: CheckpointContext): Checkpoint[] {
   return dataEntries<Checkpoint>(ctx, CHECKPOINT_TYPE)
     .filter((item) => item?.version === VERSION)
     .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function activeRedo(ctx: CheckpointContext): ActiveRedo | undefined {
+  const entry = activeEntries(ctx).findLast((item) =>
+    item.type === "custom"
+    && item.customType === REDO_TYPE
+    && (item.data as RedoRecord | undefined)?.version === 1
+  );
+  return entry ? { entryId: entry.id, data: entry.data as RedoRecord } : undefined;
 }
 
 function currentSeq(ctx: CheckpointContext): number {
@@ -308,6 +336,28 @@ async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before
   return (await restore(pi, mutation.root, mutation[side], mutation.storeBase)).files;
 }
 
+async function captureRedoGuards(pi: ExtensionAPI, selected: Mutation[]): Promise<Pick<RedoRecord, "fileGuards" | "rootGuards">> {
+  const files = new Map<string, FileState>();
+  const roots = new Map<string, RootState>();
+  for (const mutation of selected) {
+    if (mutation.kind === "file") files.set(mutation.path, captureFileState(mutation.path));
+    else roots.set(mutation.root, { root: mutation.root, tree: await capture(pi, mutation.root, mutation.storeBase), storeBase: mutation.storeBase });
+  }
+  return {
+    fileGuards: [...files].map(([path, state]) => ({ path, state })),
+    rootGuards: [...roots.values()],
+  };
+}
+
+async function assertRedoGuards(pi: ExtensionAPI, redo: RedoRecord): Promise<void> {
+  for (const guard of redo.fileGuards ?? []) {
+    if (!sameFileState(captureFileState(guard.path), guard.state)) throw new Error(`Redo unavailable because ${guard.path} changed after rollback`);
+  }
+  for (const guard of redo.rootGuards ?? []) {
+    if (await capture(pi, guard.root, guard.storeBase) !== guard.tree) throw new Error(`Redo unavailable because ${guard.root} changed after rollback`);
+  }
+}
+
 export default function rollbackExtension(pi: ExtensionAPI): void {
   const sandboxed = isHcomSandbox();
   let agentRun = 0;
@@ -427,8 +477,11 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       await flushPending(ctx);
       await captureExternalChanges(ctx);
       target = findCheckpoint(ctx, args);
+      const sourceEntryId = ctx.sessionManager.getLeafId();
+      if (!sourceEntryId) throw new Error("No active session entry to redo");
       let files = 0;
       let sandboxBefore: string | undefined;
+      let redo: RedoRecord;
       const reverted: Mutation[] = [];
       const selected = mutations(ctx).filter((item) => item.seq > target!.seq).sort((a, b) => b.seq - a.seq);
       if (sandboxed && target.mode !== "sandbox") throw new Error("Sandbox rollback refuses checkpoints created outside sandbox mode");
@@ -436,15 +489,34 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       if (target.mode === "sandbox") {
         if (!sandboxed || !target.sandbox) throw new Error("Sandbox checkpoint can only be restored inside its sandbox workspace");
         if (resolve(target.sandbox.root) !== resolve(ctx.cwd)) throw new Error("Sandbox checkpoint belongs to another workspace");
-        const result = await restore(pi, target.sandbox.root, target.sandbox.tree, target.sandbox.storeBase);
-        files += result.files;
-        sandboxBefore = result.before;
+        const restored = await restore(pi, target.sandbox.root, target.sandbox.tree, target.sandbox.storeBase);
+        files += restored.files;
+        sandboxBefore = restored.before;
+        redo = {
+          version: 1,
+          sourceEntryId,
+          targetEntryId: target.entryId,
+          targetLabel: target.label,
+          mode: "sandbox",
+          sandbox: { root: target.sandbox.root, rollbackTree: target.sandbox.tree, redoTree: restored.before, storeBase: target.sandbox.storeBase },
+          createdAt: Date.now(),
+        };
       } else {
         try {
           for (const mutation of selected) {
             files += await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
             reverted.push(mutation);
           }
+          redo = {
+            version: 1,
+            sourceEntryId,
+            targetEntryId: target.entryId,
+            targetLabel: target.label,
+            mode: "normal",
+            mutations: [...selected].reverse(),
+            ...await captureRedoGuards(pi, selected),
+            createdAt: Date.now(),
+          };
         } catch (error) {
           for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
           throw error;
@@ -482,6 +554,11 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
         targetLabel: target.label,
         files,
       });
+      try {
+        pi.appendEntry(REDO_TYPE, redo);
+      } catch (error) {
+        notify(ctx, `Rollback succeeded, but redo could not be recorded: ${String(error)}`);
+      }
       if (args.continuePrompt?.trim()) await pi.sendUserMessage(args.continuePrompt.trim());
       if (ctx.hasUI) ctx.ui.notify(`Restored ${files} file(s) and checkpoint ${target.label}`, "info");
     } catch (error) {
@@ -494,6 +571,59 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
         error: message,
       });
       if (ctx.hasUI) ctx.ui.notify(message, "error");
+    }
+  };
+
+  const runRedo = async (ctx: ExtensionCommandContext): Promise<void> => {
+    try {
+      await ctx.waitForIdle();
+      const active = activeRedo(ctx);
+      if (!active || ctx.sessionManager.getLeafId() !== active.entryId) throw new Error("Nothing to redo, or the rollback branch has advanced");
+      await flushPending(ctx);
+      if (ctx.sessionManager.getLeafId() !== active.entryId) throw new Error("Redo unavailable because files changed after rollback");
+      const redo = active.data;
+      let files = 0;
+      let sandboxBefore: string | undefined;
+      const applied: Mutation[] = [];
+
+      if (redo.mode === "sandbox") {
+        if (!sandboxed || !redo.sandbox) throw new Error("Sandbox redo can only run inside its original sandbox workspace");
+        if (resolve(redo.sandbox.root) !== resolve(ctx.cwd)) throw new Error("Redo belongs to another sandbox workspace");
+        if (await capture(pi, redo.sandbox.root, redo.sandbox.storeBase) !== redo.sandbox.rollbackTree) {
+          throw new Error("Redo unavailable because the sandbox workspace changed after rollback");
+        }
+        const restored = await restore(pi, redo.sandbox.root, redo.sandbox.redoTree, redo.sandbox.storeBase);
+        files += restored.files;
+        sandboxBefore = restored.before;
+      } else {
+        await assertRedoGuards(pi, redo);
+        try {
+          for (const mutation of redo.mutations ?? []) {
+            files += await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+            applied.push(mutation);
+          }
+        } catch (error) {
+          for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+          throw error;
+        }
+      }
+
+      let result;
+      try {
+        result = await ctx.navigateTree(redo.sourceEntryId, { summarize: false });
+      } catch (error) {
+        if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
+        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+        throw error;
+      }
+      if (result.cancelled) {
+        if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
+        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+        throw new Error("Redo cancelled");
+      }
+      if (ctx.hasUI) ctx.ui.notify(`Redid ${files} file(s) and restored checkpoint branch ${redo.targetLabel}`, "info");
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
     }
   };
 
@@ -527,6 +657,13 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
     description: "Restore files and conversation: /rollback <label>|entry:<id>|<count> [-- <continue prompt>]",
     handler: async (raw, ctx) => {
       await runRollback(parseRollbackArgs(raw), ctx);
+    },
+  });
+
+  pi.registerCommand("redo", {
+    description: "Redo the most recent rollback if its branch has not advanced",
+    handler: async (_raw, ctx) => {
+      await runRedo(ctx);
     },
   });
 

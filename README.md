@@ -19,6 +19,7 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 /rollback before-refactor
 /rollback before-refactor -- Try the smaller fix.
 /rollback entry:<session-entry-id>
+/redo
 ```
 
 Pi also exposes an LLM-callable `rollback` tool. Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued. Automatic checkpoints are captured before and after each model turn.
@@ -32,6 +33,10 @@ Other Pi extensions can dispatch a run-relative rollback with a correlation ID:
 ```
 
 Completion is persisted as a `pi-rollback-result` session entry and emitted on the shared `pi-rollback:result` event. The result includes `requestId`, `ok`, the resolved `targetEntryId`, restored file count, and an error on failure.
+
+### Redo
+
+`/redo` reverses the most recent rollback: it restores each mutation's `after` state and navigates back to the exact pre-rollback session leaf, making that branch's checkpoints active again. Redo is single-level and is refused if the rollback branch or covered files changed, so it cannot overwrite new work.
 
 ## Tracking modes
 
@@ -55,7 +60,7 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 
 - Conversation rollback uses Pi's non-destructive `ctx.navigateTree()`.
 - Project Git branches, commits, index, and stash list are not modified.
-- Restores are reversed if tree navigation fails or is cancelled.
+- Restores and redo operations are reversed if tree navigation fails or is cancelled.
 - A sandbox process refuses checkpoint data targeting paths outside its cwd.
 
 ## Limits
@@ -63,4 +68,4 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 - Requires `git` on `PATH` for shell/root snapshots.
 - Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
 - Ignored files are excluded from root snapshots unless they were directly journaled by a native file tool.
-- No redo command or automatic snapshot pruning yet.
+- No automatic snapshot pruning yet.

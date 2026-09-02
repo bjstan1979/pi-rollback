@@ -38,8 +38,19 @@ function harness(cwd: string) {
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
   const tools: string[] = [];
   const toolDefs: Record<string, any> = {};
-  const entries: any[] = [{ id: "message-0", type: "message" }];
+  const entries: any[] = [{ id: "message-0", type: "message", parentId: null }];
   let leaf = "message-0";
+  const branch = () => {
+    const active: any[] = [];
+    let current: string | null = leaf;
+    while (current) {
+      const entry = entries.find((item) => item.id === current);
+      if (!entry) break;
+      active.unshift(entry);
+      current = entry.parentId;
+    }
+    return active;
+  };
   let next = 0;
   let navigatedTo: string | undefined;
   const notifications: string[] = [];
@@ -53,7 +64,7 @@ function harness(cwd: string) {
     registerTool(tool: { name: string }) { tools.push(tool.name); toolDefs[tool.name] = tool; },
     setLabel() {},
     appendEntry(customType: string, data: unknown) {
-      const entry = { id: `custom-${++next}`, type: "custom", customType, data };
+      const entry = { id: `custom-${++next}`, type: "custom", customType, data, parentId: leaf };
       entries.push(entry);
       leaf = entry.id;
     },
@@ -66,14 +77,19 @@ function harness(cwd: string) {
     sessionManager: {
       getLeafId: () => leaf,
       getSessionId: () => "session-test",
-      getBranch: () => entries,
+      getBranch: branch,
       getEntries: () => entries,
     },
     async waitForIdle() {},
-    async navigateTree(target: string) { navigatedTo = target; return { cancelled: false }; },
+    async navigateTree(target: string) {
+      assert.ok(entries.some((entry) => entry.id === target), `missing navigation target ${target}`);
+      navigatedTo = target;
+      leaf = target;
+      return { cancelled: false };
+    },
   };
   rollbackExtension(pi);
-  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo };
+  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo, activeEntries: branch };
 }
 
 test("root snapshot restores files without touching the project git index", async () => {
@@ -94,7 +110,7 @@ test("root snapshot restores files without touching the project git index", asyn
   assert.equal(existsSync(join(cwd, "created.txt")), false);
 });
 
-test("normal mode journals writes outside cwd and rolls them back", async () => {
+test("normal mode rollback and redo restore files plus the original checkpoint branch", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-cwd-"));
   const external = mkdtempSync(join(tmpdir(), "pi-rollback-external-"));
   cleanup.push(cwd, external, snapshotDir(cwd), snapshotDir(external));
@@ -108,10 +124,38 @@ test("normal mode journals writes outside cwd and rolls them back", async () => 
   writeFileSync(file, "modified outside cwd\n");
   await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
   assert.equal(readFileSync(file, "utf8"), "modified outside cwd\n");
+  const originalLeaf = run.ctx.sessionManager.getLeafId();
+  const originalLabels = run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []);
 
   await run.commands.rollback!("1", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "original\n");
   assert.equal(run.navigatedTo(), "message-0");
+  assert.deepEqual(run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []), []);
+
+  await run.commands.redo!("", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "modified outside cwd\n");
+  assert.equal(run.navigatedTo(), originalLeaf);
+  assert.deepEqual(run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []), originalLabels);
+});
+
+test("redo refuses to overwrite changes made after rollback", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-redo-guard-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "agent change\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  await run.commands.rollback!("1", run.ctx);
+
+  writeFileSync(file, "new work after rollback\n");
+  await run.commands.redo!("", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "new work after rollback\n");
+  assert.match(run.notifications.at(-1)!, /changed after rollback/);
 });
 
 test("preserves the agent-written checkpoint when an external edit happens later", async () => {
@@ -173,6 +217,8 @@ test("sandbox mode snapshots cwd only and stores its shadow repo inside cwd", as
 
     await run.commands.rollback!("1", run.ctx);
     assert.equal(readFileSync(file, "utf8"), "sandbox original\n");
+    await run.commands.redo!("", run.ctx);
+    assert.equal(readFileSync(file, "utf8"), "sandbox changed\n");
   } finally {
     if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
     if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
@@ -251,6 +297,6 @@ test("registers mutation hooks and commands", () => {
   cleanup.push(cwd);
   const run = harness(cwd);
   assert.deepEqual(Object.keys(run.handlers), ["tool_call", "agent_start", "turn_start", "turn_end", "agent_settled"]);
-  assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback"]);
+  assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback", "redo"]);
   assert.deepEqual(run.tools, ["rollback"]);
 });
