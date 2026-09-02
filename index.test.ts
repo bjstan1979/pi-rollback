@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import rollbackExtension, { capture, parseRollbackArgs, restore, ROLLBACK_RESULT_EVENT, snapshotDir } from "./index.js";
-import { isHcomSandbox, mutationPaths } from "./journal.js";
+import rollbackExtension, { capture, parseRollbackArgs, restore, ROLLBACK_RESULT_EVENT, sessionStore, snapshotDir } from "./index.js";
+import { bashPathHints, isHcomSandbox, mutationPaths } from "./journal.js";
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -22,6 +22,9 @@ test("parses human-friendly rollback commands and retains JSON compatibility", (
   assert.deepEqual(parseRollbackArgs("2 -- Retry carefully."), { count: 2, continuePrompt: "Retry carefully." });
   assert.deepEqual(parseRollbackArgs('{"runCount":1,"requestId":"remote"}'), { runCount: 1, requestId: "remote" });
   assert.throws(() => parseRollbackArgs("before-refactor --"), /Missing continuation prompt/);
+  assert.throws(() => parseRollbackArgs('{"continuePrompt":1}'), /continuePrompt must be a string/);
+  assert.throws(() => parseRollbackArgs('{"count":0}'), /count must be a positive integer/);
+  assert.throws(() => parseRollbackArgs('{"typo":1}'), /Unknown rollback option/);
 });
 
 function exec(command: string, args: string[], options?: { cwd?: string }) {
@@ -33,7 +36,8 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string) {
+function harness(cwd: string, options: { sandboxed?: boolean; sendUserMessageError?: Error } = {}) {
+  cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
   const tools: string[] = [];
@@ -68,7 +72,10 @@ function harness(cwd: string) {
       entries.push(entry);
       leaf = entry.id;
     },
-    async sendUserMessage(content: string, options: unknown) { sentMessages.push({ content, options }); },
+    async sendUserMessage(content: string, sendOptions: unknown) {
+      if (options.sendUserMessageError) throw options.sendUserMessageError;
+      sentMessages.push({ content, options: sendOptions });
+    },
   } as unknown as ExtensionAPI;
   const ctx = {
     cwd,
@@ -88,7 +95,17 @@ function harness(cwd: string) {
       return { cancelled: false };
     },
   };
-  rollbackExtension(pi);
+  const oldMode = process.env.HCOM_WORKER_SANDBOX;
+  const oldRoot = process.env.HCOM_WORKER_SANDBOX_ROOT;
+  if (options.sandboxed) process.env.HCOM_WORKER_SANDBOX = "workspace";
+  else delete process.env.HCOM_WORKER_SANDBOX;
+  delete process.env.HCOM_WORKER_SANDBOX_ROOT;
+  try {
+    rollbackExtension(pi);
+  } finally {
+    if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
+    if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
+  }
   return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo, activeEntries: branch };
 }
 
@@ -108,6 +125,96 @@ test("root snapshot restores files without touching the project git index", asyn
   assert.equal((await restore(pi, cwd, target)).files, 2);
   assert.equal(readFileSync(join(cwd, "kept.txt"), "utf8"), "before\n");
   assert.equal(existsSync(join(cwd, "created.txt")), false);
+});
+
+test("snapshot repositories are isolated by session", () => {
+  assert.notEqual(snapshotDir("/work", sessionStore("session-a")), snapshotDir("/work", sessionStore("session-b")));
+});
+
+test("concurrent sessions cannot overwrite each other's capture index", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-concurrent-sessions-"));
+  const storeA = sessionStore("concurrent-a");
+  const storeB = sessionStore("concurrent-b");
+  cleanup.push(cwd, storeA, storeB);
+  const file = join(cwd, "demo.txt");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reachedWriteTree!: () => void;
+  const paused = new Promise<void>((resolve) => { reachedWriteTree = resolve; });
+  const delayedPi = {
+    async exec(command: string, args: string[], options?: { cwd?: string }) {
+      if (args.includes("write-tree")) {
+        reachedWriteTree();
+        await gate;
+      }
+      return exec(command, args, options);
+    },
+  } as ExtensionAPI;
+
+  writeFileSync(file, "snapshot A\n");
+  const captureA = capture(delayedPi, cwd, storeA);
+  await paused;
+  writeFileSync(file, "snapshot B\n");
+  const treeB = await capture(mockPi(), cwd, storeB);
+  release();
+  const treeA = await captureA;
+  assert.notEqual(treeA, treeB);
+});
+
+test("captured trees remain reachable after later captures and Git pruning", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-pinned-tree-"));
+  const gitDir = snapshotDir(cwd);
+  cleanup.push(cwd, gitDir);
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "snapshot A\n");
+  const treeA = await capture(mockPi(), cwd);
+  writeFileSync(file, "snapshot B\n");
+  await capture(mockPi(), cwd);
+  assert.equal(spawnSync("git", ["--git-dir", gitDir, "prune", "--expire", "now"]).status, 0);
+  assert.equal(spawnSync("git", ["--git-dir", gitDir, "cat-file", "-e", treeA]).status, 0);
+});
+
+test("restore never deletes files when Git cannot inspect the target tree", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-inspection-failure-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "target\n");
+  const target = await capture(mockPi(), cwd);
+  writeFileSync(file, "current\n");
+  const pi = {
+    async exec(command: string, args: string[], options?: { cwd?: string }) {
+      if (args.includes("ls-tree")) return { stdout: "", stderr: "repository I/O failure", code: 128, killed: false };
+      return exec(command, args, options);
+    },
+  } as ExtensionAPI;
+
+  await assert.rejects(restore(pi, cwd, target), /original workspace state could not be restored/);
+  assert.equal(readFileSync(file, "utf8"), "current\n");
+});
+
+test("restore reverses files already changed when a later checkout fails", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-partial-failure-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const first = join(cwd, "a.txt");
+  const second = join(cwd, "b.txt");
+  writeFileSync(first, "target\n");
+  writeFileSync(second, "target\n");
+  const target = await capture(mockPi(), cwd);
+  writeFileSync(first, "current\n");
+  writeFileSync(second, "current\n");
+  let checkouts = 0;
+  const pi = {
+    async exec(command: string, args: string[], options?: { cwd?: string }) {
+      if (args.includes("checkout") && ++checkouts === 2) {
+        return { stdout: "", stderr: "injected checkout failure", code: 1, killed: false };
+      }
+      return exec(command, args, options);
+    },
+  } as ExtensionAPI;
+
+  await assert.rejects(restore(pi, cwd, target), /injected checkout failure/);
+  assert.equal(readFileSync(first, "utf8"), "current\n");
+  assert.equal(readFileSync(second, "utf8"), "current\n");
 });
 
 test("normal mode rollback and redo restore files plus the original checkpoint branch", async () => {
@@ -198,31 +305,22 @@ test("tracks a bash mutation in another project root", async () => {
 });
 
 test("sandbox mode snapshots cwd only and stores its shadow repo inside cwd", async () => {
-  const oldMode = process.env.HCOM_WORKER_SANDBOX;
-  const oldRoot = process.env.HCOM_WORKER_SANDBOX_ROOT;
-  process.env.HCOM_WORKER_SANDBOX = "workspace";
-  delete process.env.HCOM_WORKER_SANDBOX_ROOT;
-  try {
-    const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-sandbox-"));
-    cleanup.push(cwd);
-    const file = join(cwd, "demo.txt");
-    writeFileSync(file, "sandbox original\n");
-    const run = harness(cwd);
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-sandbox-"));
+  cleanup.push(cwd);
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "sandbox original\n");
+  const run = harness(cwd, { sandboxed: true });
 
-    await run.handlers.agent_start!({}, run.ctx);
-    await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
-    writeFileSync(file, "sandbox changed\n");
-    await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
-    assert.equal(existsSync(join(cwd, ".pi", ".rollback-snapshots")), true);
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  writeFileSync(file, "sandbox changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  assert.equal(existsSync(join(cwd, ".pi", ".rollback-snapshots")), true);
 
-    await run.commands.rollback!("1", run.ctx);
-    assert.equal(readFileSync(file, "utf8"), "sandbox original\n");
-    await run.commands.redo!("", run.ctx);
-    assert.equal(readFileSync(file, "utf8"), "sandbox changed\n");
-  } finally {
-    if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
-    if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
-  }
+  await run.commands.rollback!("1", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "sandbox original\n");
+  await run.commands.redo!("", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "sandbox changed\n");
 });
 
 test("sandbox detection uses canonical active modes and path filtering", () => {
@@ -235,6 +333,12 @@ test("sandbox detection uses canonical active modes and path filtering", () => {
   cleanup.push(cwd, external);
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, true), []);
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, false), [join(external, "x.txt")]);
+});
+
+test("path hints include quoted POSIX and Windows absolute arguments", () => {
+  assert.ok(bashPathHints('printf changed > "/outside root/demo.txt"', "/work").includes("/outside root/demo.txt"));
+  const windowsPath = win32.normalize("C:\\outside root\\demo.txt");
+  assert.ok(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work").includes(windowsPath));
 });
 test("run-count rollback crosses intervening automatic turn checkpoints and publishes a result", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-entry-"));
@@ -277,6 +381,20 @@ test("failed requested rollback publishes a machine-readable result", async () =
   assert.equal(result.ok, false);
   assert.match(result.error, /Can roll back at most 0 agent run/);
   assert.equal(run.navigatedTo(), undefined);
+});
+
+test("continuation queue failure does not publish a contradictory rollback failure", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-continuation-result-"));
+  cleanup.push(cwd);
+  const run = harness(cwd, { sendUserMessageError: new Error("queue unavailable") });
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!('{"count":1,"requestId":"same","continuePrompt":"continue"}', run.ctx);
+  assert.equal(run.emitted.length, 1);
+  assert.equal((run.emitted[0]!.data as { ok: boolean }).ok, true);
+  assert.match(run.notifications.join("\n"), /continuation could not be queued/);
 });
 
 test("LLM rollback tool dispatches the extension command on the follow-up turn", async () => {

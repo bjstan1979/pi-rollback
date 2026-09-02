@@ -48,7 +48,7 @@ Rollback never deletes later checkpoints; they remain on the original inactive b
 
 - `write`, `edit`, `undo_last_edit`, and `ts_morph` are journaled by their actual canonical file path, including paths outside Pi's cwd.
 - File contents are deduplicated in `~/.pi/agent/rollback-snapshots/blobs/`.
-- Bash/PowerShell use shadow-Git snapshots for cwd, previously touched project roots, and roots inferred from `cd`, `git -C`, and absolute path arguments.
+- Bash/PowerShell use session-isolated shadow-Git snapshots for cwd, previously touched project roots, and roots inferred from `cd`, `git -C`, and POSIX or Windows absolute path arguments.
 - Later external edits to known files/roots are recorded at the next turn boundary, preserving the prior agent-written state.
 
 ### HCOM sandbox
@@ -57,14 +57,14 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 
 - Tracking and restore are strictly cwd-only.
 - Full cwd snapshots cover file tools and shell commands.
-- The shadow repository is stored at `<cwd>/.pi/.rollback-snapshots/` because cwd is the writable sandbox boundary; that directory excludes itself from snapshots.
+- Session-isolated shadow repositories are stored below `<cwd>/.pi/.rollback-snapshots/` because cwd is the writable sandbox boundary; that directory excludes itself from snapshots.
 - Podman workers use a persistent workspace-private `PI_CODING_AGENT_DIR`; install/copy this extension into that private extension directory before starting the worker. Host-global extensions are not mirrored automatically.
 
 ## Safety
 
 - Conversation rollback uses Pi's non-destructive `ctx.navigateTree()`.
 - Project Git branches, commits, index, and stash list are not modified.
-- Restores and redo operations are reversed if tree navigation fails or is cancelled.
+- Root restores are reversed if a Git operation, tree navigation, or cancellation interrupts the rollback.
 - A sandbox process refuses checkpoint data targeting paths outside its cwd.
 
 ## Limits
@@ -72,4 +72,4 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 - Requires `git` on `PATH` for shell/root snapshots.
 - Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
 - Ignored files are excluded from root snapshots unless they were directly journaled by a native file tool.
-- No automatic snapshot pruning yet.
+- Snapshot trees are pinned against Git garbage collection, but automatic snapshot pruning is not implemented yet.

@@ -1,6 +1,6 @@
 {
   "name": "pi-rollback",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Branch-aware conversation and workspace rollback for Pi",
   "type": "module",
   "license": "MIT",

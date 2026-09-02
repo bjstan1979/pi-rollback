@@ -11,7 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { homedir } from "node:os";
 
 export const BLOB_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots", "blobs");
@@ -104,15 +104,19 @@ export function bashPathHints(command: string, cwd: string): string[] {
   const add = (raw: string): void => {
     const value = raw.replace(/^['"]|['"]$/g, "");
     if (!value) return;
-    const path = resolve(cwd, value);
-    if (path === "/" || path === resolve(process.env.HOME || "/nonexistent")) return;
+    const windows = !value.startsWith("/") && win32.isAbsolute(value);
+    const path = windows ? win32.normalize(value) : resolve(cwd, value);
+    const root = windows ? win32.parse(path).root : "/";
+    const home = windows ? process.env.USERPROFILE : process.env.HOME;
+    if (path.toLowerCase() === root.toLowerCase() || (home && path.toLowerCase() === home.toLowerCase())) return;
+    if (!windows && ["/usr/bin/", "/bin/", "/sbin/"].some((prefix) => path.startsWith(prefix))) return;
     hints.add(path);
   };
   for (const match of command.matchAll(/(?:^|[;&|]\s*|\s)cd\s+(?:--\s+)?((?:'[^']+'|"[^"]+"|[^\s;&|]+))/g)) add(match[1]!);
   for (const match of command.matchAll(/(?:^|\s)git\s+-C\s+((?:'[^']+'|"[^"]+"|[^\s;&|]+))/g)) add(match[1]!);
-  for (const match of command.matchAll(/(?:^|\s)(\/(?:[^\s'";&|<>])+)/g)) {
-    const path = match[1]!;
-    if (!path.startsWith("/usr/bin/") && !path.startsWith("/bin/") && !path.startsWith("/sbin/")) add(path);
+  for (const match of command.matchAll(/(?:^|[\s<>])((?:'[^']+'|"[^"]+"|[^\s;&|<>]+))/g)) {
+    const value = match[1]!.replace(/^['"]|['"]$/g, "");
+    if (isAbsolute(value) || (!value.startsWith("/") && win32.isAbsolute(value))) add(match[1]!);
   }
   return [...hints];
 }

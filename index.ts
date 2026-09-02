@@ -118,9 +118,12 @@ function safeHash(value: string): string {
 export function snapshotDir(cwd: string, storeBase = SNAPSHOT_ROOT): string {
   return join(storeBase, safeHash(cwd));
 }
+export function sessionStore(sessionId: string): string {
+  return join(SNAPSHOT_ROOT, "sessions", safeHash(sessionId));
+}
 
-function sandboxStore(cwd: string): string {
-  return join(cwd, ".pi", ".rollback-snapshots");
+function sandboxStore(cwd: string, sessionId: string): string {
+  return join(cwd, ".pi", ".rollback-snapshots", safeHash(sessionId));
 }
 
 async function git(pi: ExtensionAPI, cwd: string, args: string[]): Promise<string> {
@@ -149,20 +152,37 @@ export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHO
   excludeNestedStore(cwd, gitDir);
   // ponytail: root snapshots include every non-ignored file; native file tools use the cheaper journal path.
   await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "add", "--all", "--", "."]);
-  return git(pi, cwd, ["--git-dir", gitDir, "write-tree"]);
-}
-
-async function pin(pi: ExtensionAPI, state: RootState, sessionId: string, entryId: string): Promise<void> {
-  const gitDir = snapshotDir(state.root, state.storeBase);
-  const session = safeHash(sessionId).slice(0, 16);
-  const entry = safeHash(entryId).slice(0, 16);
-  await git(pi, state.root, ["--git-dir", gitDir, "update-ref", `refs/pi-rollback/${session}/${entry}/${state.tree}`, state.tree]);
+  const tree = await git(pi, cwd, ["--git-dir", gitDir, "write-tree"]);
+  await git(pi, cwd, ["--git-dir", gitDir, "update-ref", `refs/pi-rollback/trees/${tree}`, tree]);
+  return tree;
 }
 
 async function changedPaths(pi: ExtensionAPI, cwd: string, from: string, to: string, storeBase: string): Promise<string[]> {
   const gitDir = snapshotDir(cwd, storeBase);
   const output = await git(pi, cwd, ["--git-dir", gitDir, "diff", "--name-only", "-z", "--no-renames", from, to, "--", "."]);
   return output.split("\0").filter(Boolean);
+}
+async function treeHasPath(pi: ExtensionAPI, cwd: string, tree: string, path: string, storeBase: string): Promise<boolean> {
+  const gitDir = snapshotDir(cwd, storeBase);
+  const output = await git(pi, cwd, ["--git-dir", gitDir, "ls-tree", "-r", "-z", "--name-only", tree, "--", path]);
+  return output.split("\0").some((entry) => entry === path || entry.startsWith(`${path}/`));
+}
+
+async function restoreTree(pi: ExtensionAPI, cwd: string, target: string, from: string, storeBase: string): Promise<number> {
+  const paths = await changedPaths(pi, cwd, target, from, storeBase);
+  const gitDir = snapshotDir(cwd, storeBase);
+  for (const path of paths) {
+    const absolute = resolve(cwd, path);
+    const scoped = relative(cwd, absolute);
+    if (scoped.startsWith("..") || isAbsolute(scoped)) throw new Error(`Snapshot path escapes workspace: ${path}`);
+    if (await treeHasPath(pi, cwd, target, path, storeBase)) {
+      await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "checkout", target, "--", path]);
+    } else {
+      rmSync(absolute, { recursive: true, force: true });
+    }
+  }
+  await git(pi, cwd, ["--git-dir", gitDir, "read-tree", target]);
+  return paths.length;
 }
 
 export async function restore(
@@ -172,18 +192,16 @@ export async function restore(
   storeBase = SNAPSHOT_ROOT,
 ): Promise<{ files: number; before: string }> {
   const current = await capture(pi, cwd, storeBase);
-  const paths = await changedPaths(pi, cwd, target, current, storeBase);
-  const gitDir = snapshotDir(cwd, storeBase);
-  for (const path of paths) {
-    const absolute = resolve(cwd, path);
-    const scoped = relative(cwd, absolute);
-    if (scoped.startsWith("..") || isAbsolute(scoped)) throw new Error(`Snapshot path escapes workspace: ${path}`);
-    const exists = await pi.exec("git", ["--git-dir", gitDir, "cat-file", "-e", `${target}:${path}`], { cwd, timeout: 30_000 });
-    if (exists.code === 0) await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "checkout", target, "--", path]);
-    else rmSync(absolute, { recursive: true, force: true });
+  try {
+    return { files: await restoreTree(pi, cwd, target, current, storeBase), before: current };
+  } catch (restoreError) {
+    try {
+      await restoreTree(pi, cwd, current, target, storeBase);
+    } catch (recoveryError) {
+      throw new AggregateError([restoreError, recoveryError], "Rollback failed and the original workspace state could not be restored");
+    }
+    throw restoreError;
   }
-  await git(pi, cwd, ["--git-dir", gitDir, "read-tree", target]);
-  return { files: paths.length, before: current };
 }
 
 function activeEntries(ctx: CheckpointContext): SessionEntry[] {
@@ -243,10 +261,9 @@ async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: s
     mode: sandboxed ? "sandbox" : "normal",
   };
   if (sandboxed) {
-    const storeBase = sandboxStore(ctx.cwd);
+    const storeBase = sandboxStore(ctx.cwd, ctx.sessionManager.getSessionId());
     const tree = await capture(pi, ctx.cwd, storeBase);
     checkpoint.sandbox = { root: ctx.cwd, tree, storeBase };
-    await pin(pi, checkpoint.sandbox, ctx.sessionManager.getSessionId(), entryId);
   }
   pi.setLabel(entryId, label);
   pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
@@ -265,11 +282,27 @@ function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId
   if (/\s/.test(targetLabel)) throw new Error("Checkpoint labels cannot contain spaces; use the label shown by /checkpoints");
   return { targetLabel };
 }
+function jsonRollbackArgs(value: unknown): RollbackArgs {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Rollback JSON must be an object");
+  const args = value as Record<string, unknown>;
+  const allowed = new Set(["targetLabel", "targetEntryId", "count", "runCount", "requestId", "continuePrompt", "summarize"]);
+  for (const key of Object.keys(args)) if (!allowed.has(key)) throw new Error(`Unknown rollback option: ${key}`);
+  for (const key of ["targetLabel", "targetEntryId", "requestId", "continuePrompt"]) {
+    if (args[key] !== undefined && typeof args[key] !== "string") throw new Error(`Rollback ${key} must be a string`);
+  }
+  for (const key of ["count", "runCount"]) {
+    if (args[key] !== undefined && (!Number.isSafeInteger(args[key]) || (args[key] as number) < 1)) {
+      throw new Error(`Rollback ${key} must be a positive integer`);
+    }
+  }
+  if (args.summarize !== undefined && typeof args.summarize !== "boolean") throw new Error("Rollback summarize must be a boolean");
+  return args as RollbackArgs;
+}
 
 export function parseRollbackArgs(raw: string): RollbackArgs {
   const input = raw.trim();
   if (!input) return { count: 1 };
-  if (input.startsWith("{")) return JSON.parse(input) as RollbackArgs;
+  if (input.startsWith("{")) return jsonRollbackArgs(JSON.parse(input));
   const delimiter = input.match(/\s+--(?:\s+|$)/);
   if (!delimiter || delimiter.index === undefined) return humanTarget(input);
   const target = input.slice(0, delimiter.index).trim();
@@ -430,7 +463,8 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)));
       for (const root of roots) {
         if (pendingRoots.has(root)) continue;
-        pendingRoots.set(root, { root, before: await capture(pi, root), storeBase: SNAPSHOT_ROOT });
+        const storeBase = sessionStore(ctx.sessionManager.getSessionId());
+        pendingRoots.set(root, { root, before: await capture(pi, root, storeBase), storeBase });
       }
     } catch (error) {
       notify(ctx, `Rollback preflight skipped: ${String(error)}`);
@@ -559,7 +593,13 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       } catch (error) {
         notify(ctx, `Rollback succeeded, but redo could not be recorded: ${String(error)}`);
       }
-      if (args.continuePrompt?.trim()) await pi.sendUserMessage(args.continuePrompt.trim());
+      if (args.continuePrompt?.trim()) {
+        try {
+          await pi.sendUserMessage(args.continuePrompt.trim());
+        } catch (error) {
+          notify(ctx, `Rollback succeeded, but the continuation could not be queued: ${String(error)}`);
+        }
+      }
       if (ctx.hasUI) ctx.ui.notify(`Restored ${files} file(s) and checkpoint ${target.label}`, "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
