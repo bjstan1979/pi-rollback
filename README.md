@@ -16,9 +16,9 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 /checkpoint before-refactor
 /checkpoints
 /rollback 1
-/rollback {"targetLabel":"before-refactor"}
-/rollback {"targetLabel":"before-refactor","continuePrompt":"Try the smaller fix."}
-/rollback {"targetEntryId":"<session-entry-id>"}
+/rollback before-refactor
+/rollback before-refactor -- Try the smaller fix.
+/rollback entry:<session-entry-id>
 ```
 
 Pi also exposes an LLM-callable `rollback` tool. Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued. Automatic checkpoints are captured before and after each model turn.

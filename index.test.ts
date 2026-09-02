@@ -5,12 +5,23 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import rollbackExtension, { capture, restore, ROLLBACK_RESULT_EVENT, snapshotDir } from "./index.js";
+import rollbackExtension, { capture, parseRollbackArgs, restore, ROLLBACK_RESULT_EVENT, snapshotDir } from "./index.js";
 import { isHcomSandbox, mutationPaths } from "./journal.js";
 
 const cleanup: string[] = [];
 afterEach(() => {
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
+});
+test("parses human-friendly rollback commands and retains JSON compatibility", () => {
+  assert.deepEqual(parseRollbackArgs("before-refactor"), { targetLabel: "before-refactor" });
+  assert.deepEqual(parseRollbackArgs("before-refactor -- Try the smaller fix."), {
+    targetLabel: "before-refactor",
+    continuePrompt: "Try the smaller fix.",
+  });
+  assert.deepEqual(parseRollbackArgs("entry:message-42"), { targetEntryId: "message-42" });
+  assert.deepEqual(parseRollbackArgs("2 -- Retry carefully."), { count: 2, continuePrompt: "Retry carefully." });
+  assert.deepEqual(parseRollbackArgs('{"runCount":1,"requestId":"remote"}'), { runCount: 1, requestId: "remote" });
+  assert.throws(() => parseRollbackArgs("before-refactor --"), /Missing continuation prompt/);
 });
 
 function exec(command: string, args: string[], options?: { cwd?: string }) {

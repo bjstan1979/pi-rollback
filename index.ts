@@ -225,11 +225,29 @@ async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: s
   return checkpoint;
 }
 
-function parseArgs(raw: string): RollbackArgs {
+function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId" | "targetLabel"> {
+  if (/^\d+$/.test(value)) return { count: Number(value) };
+  if (value.startsWith("entry:")) {
+    const targetEntryId = value.slice("entry:".length).trim();
+    if (!targetEntryId) throw new Error("Missing entry id after entry:");
+    return { targetEntryId };
+  }
+  const targetLabel = value.startsWith("label:") ? value.slice("label:".length).trim() : value;
+  if (!targetLabel) throw new Error("Missing rollback target");
+  if (/\s/.test(targetLabel)) throw new Error("Checkpoint labels cannot contain spaces; use the label shown by /checkpoints");
+  return { targetLabel };
+}
+
+export function parseRollbackArgs(raw: string): RollbackArgs {
   const input = raw.trim();
   if (!input) return { count: 1 };
-  if (/^\d+$/.test(input)) return { count: Number(input) };
-  return JSON.parse(input) as RollbackArgs;
+  if (input.startsWith("{")) return JSON.parse(input) as RollbackArgs;
+  const delimiter = input.match(/\s+--(?:\s+|$)/);
+  if (!delimiter || delimiter.index === undefined) return humanTarget(input);
+  const target = input.slice(0, delimiter.index).trim();
+  const continuePrompt = input.slice(delimiter.index + delimiter[0].length).trim();
+  if (!continuePrompt) throw new Error("Missing continuation prompt after --");
+  return { ...humanTarget(target), continuePrompt };
 }
 
 function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint {
@@ -506,9 +524,9 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("rollback", {
-    description: "Restore files and conversation: /rollback 1 or /rollback {\"targetLabel\":\"name\"}",
+    description: "Restore files and conversation: /rollback <label>|entry:<id>|<count> [-- <continue prompt>]",
     handler: async (raw, ctx) => {
-      await runRollback(parseArgs(raw), ctx);
+      await runRollback(parseRollbackArgs(raw), ctx);
     },
   });
 
