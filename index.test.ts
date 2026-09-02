@@ -127,6 +127,32 @@ test("root snapshot restores files without touching the project git index", asyn
   assert.equal(existsSync(join(cwd, "created.txt")), false);
 });
 
+test("snapshot keeps readable files when Git skips an unindexable path", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-unreadable-"));
+  const gitDir = snapshotDir(cwd);
+  cleanup.push(cwd, gitDir);
+  writeFileSync(join(cwd, "kept.txt"), "kept\n");
+  writeFileSync(join(cwd, "runtime.lock"), "unreadable\n");
+  let fatal = false;
+  const pi = {
+    async exec(command: string, args: string[], options?: { cwd?: string }) {
+      if (args.includes("--ignore-errors")) {
+        if (fatal) return { stdout: "", stderr: "fatal storage failure", code: 128, killed: false };
+        const staged = await exec(command, [...args.slice(0, -1), "kept.txt"], options);
+        return { ...staged, stderr: 'error: open("runtime.lock"): Permission denied', code: 1 };
+      }
+      return exec(command, args, options);
+    },
+  } as ExtensionAPI;
+
+  const tree = await capture(pi, cwd);
+  const listed = spawnSync("git", ["--git-dir", gitDir, "ls-tree", "-r", "--name-only", tree], { encoding: "utf8" });
+  assert.equal(listed.status, 0);
+  assert.equal(listed.stdout, "kept.txt\n");
+  fatal = true;
+  await assert.rejects(capture(pi, cwd), /fatal storage failure/);
+});
+
 test("snapshot repositories are isolated by session", () => {
   assert.notEqual(snapshotDir("/work", sessionStore("session-a")), snapshotDir("/work", sessionStore("session-b")));
 });

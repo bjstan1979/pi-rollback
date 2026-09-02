@@ -143,6 +143,12 @@ function excludeNestedStore(root: string, gitDir: string): void {
   writeFileSync(join(gitDir, "info", "exclude"), `${exclusions.join("\n")}\n`, { mode: 0o600 });
 }
 
+async function stageSnapshot(pi: ExtensionAPI, cwd: string, gitDir: string): Promise<void> {
+  await git(pi, cwd, ["--git-dir", gitDir, "read-tree", "--empty"]);
+  const result = await pi.exec("git", ["--git-dir", gitDir, "--work-tree", cwd, "add", "--all", "--ignore-errors", "--", "."], { cwd, timeout: 30_000 });
+  if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr.trim() || "git add failed");
+}
+
 export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHOT_ROOT): Promise<string> {
   const gitDir = snapshotDir(cwd, storeBase);
   if (!existsSync(gitDir)) {
@@ -151,7 +157,7 @@ export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHO
   }
   excludeNestedStore(cwd, gitDir);
   // ponytail: root snapshots include every non-ignored file; native file tools use the cheaper journal path.
-  await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "add", "--all", "--", "."]);
+  await stageSnapshot(pi, cwd, gitDir);
   const tree = await git(pi, cwd, ["--git-dir", gitDir, "write-tree"]);
   await git(pi, cwd, ["--git-dir", gitDir, "update-ref", `refs/pi-rollback/trees/${tree}`, tree]);
   return tree;

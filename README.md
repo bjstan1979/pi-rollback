@@ -71,5 +71,5 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 
 - Requires `git` on `PATH` for shell/root snapshots.
 - Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
-- Ignored files are excluded from root snapshots unless they were directly journaled by a native file tool.
+- Ignored or unreadable files are excluded from root snapshots unless they were directly journaled by a native file tool; other Git failures still fail closed.
 - Snapshot trees are pinned against Git garbage collection, but automatic snapshot pruning is not implemented yet.
