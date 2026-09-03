@@ -702,7 +702,12 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "rollback",
     label: "Rollback",
-    description: "Queue rollback to the start of this agent run, or an explicit saved checkpoint.",
+    description: "Queue rollback to the start of this agent run, or restore an explicit checkpoint by label or entry ID.",
+    promptSnippet: "Roll back conversation and journaled workspace files to an earlier agent run or checkpoint",
+    promptGuidelines: [
+      "Use rollback when the user asks to undo or roll back your latest agent run; count is run-relative (default 1), while targetLabel/targetEntryId restore explicit checkpoints. The rollback is queued after the current turn, so stop making changes after calling it.",
+      "Do not use rollback merely to fix an ordinary mistake when a direct edit is sufficient. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label>|entry:<id>|<count> [-- <continue prompt>], and /redo.",
+    ],
     parameters: Type.Object({
       targetLabel: Type.Optional(Type.String()),
       targetEntryId: Type.Optional(Type.String()),

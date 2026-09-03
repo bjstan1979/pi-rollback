@@ -476,6 +476,8 @@ test("LLM rollback tool dispatches the extension command on the follow-up turn",
     content: '/rollback {"summarize":true,"targetEntryId":"message-0"}',
     options: { deliverAs: "followUp", expandPromptTemplates: true },
   }]);
+  assert.match(run.toolDefs.rollback.promptSnippet, /conversation and journaled workspace files/);
+  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /count is run-relative/);
 });
 
 test("registers mutation hooks and commands", () => {
