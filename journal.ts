@@ -75,17 +75,24 @@ export function sameFileState(a: FileState, b: FileState): boolean {
 
 export function restoreFileState(path: string, state: FileState): void {
   if (state.kind === "missing") {
-    rmSync(path, { recursive: true, force: true });
+    if (existsSync(path)) {
+      if (lstatSync(path).isDirectory()) throw new Error(`Refusing to remove directory for missing file state: ${path}`);
+      rmSync(path, { force: true });
+    }
     return;
   }
   const content = readFileSync(blobPath(state.blob));
   if (createHash("sha256").update(content).digest("hex") !== state.blob) throw new Error(`Corrupt rollback blob: ${state.blob}`);
   mkdirSync(dirname(path), { recursive: true });
   const temporary = join(dirname(path), `.${basename(path)}.pi-rollback-${process.pid}-${randomUUID()}`);
-  writeFileSync(temporary, content, { mode: state.mode });
-  chmodSync(temporary, state.mode);
-  if (existsSync(path) && statSync(path).isDirectory()) rmSync(path, { recursive: true, force: true });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, content, { mode: state.mode });
+    chmodSync(temporary, state.mode);
+    if (existsSync(path) && statSync(path).isDirectory()) rmSync(path, { recursive: true, force: true });
+    renameSync(temporary, path);
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary, { force: true });
+  }
 }
 
 export function mutationPaths(toolName: string, input: unknown, cwd: string, sandboxed: boolean): string[] {
@@ -99,12 +106,12 @@ export function mutationPaths(toolName: string, input: unknown, cwd: string, san
 }
 
 /** Conservative hints only; arbitrary shell side effects cannot be inferred statically. */
-export function bashPathHints(command: string, cwd: string): string[] {
+export function bashPathHints(command: string, cwd: string, platform: string = process.platform): string[] {
   const hints = new Set<string>();
   const add = (raw: string): void => {
     const value = raw.replace(/^['"]|['"]$/g, "");
     if (!value) return;
-    const windows = !value.startsWith("/") && win32.isAbsolute(value);
+    const windows = platform === "win32" && !value.startsWith("/") && win32.isAbsolute(value);
     const path = windows ? win32.normalize(value) : resolve(cwd, value);
     const root = windows ? win32.parse(path).root : "/";
     const home = windows ? process.env.USERPROFILE : process.env.HOME;
@@ -116,7 +123,7 @@ export function bashPathHints(command: string, cwd: string): string[] {
   for (const match of command.matchAll(/(?:^|\s)git\s+-C\s+((?:'[^']+'|"[^"]+"|[^\s;&|]+))/g)) add(match[1]!);
   for (const match of command.matchAll(/(?:^|[\s<>])((?:'[^']+'|"[^"]+"|[^\s;&|<>]+))/g)) {
     const value = match[1]!.replace(/^['"]|['"]$/g, "");
-    if (isAbsolute(value) || (!value.startsWith("/") && win32.isAbsolute(value))) add(match[1]!);
+    if (isAbsolute(value) || (platform === "win32" && !value.startsWith("/") && win32.isAbsolute(value))) add(match[1]!);
   }
   return [...hints];
 }

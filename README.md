@@ -70,6 +70,8 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 ## Limits
 
 - `PI_ROLLBACK_DEEP_TRACKING=1` requires `git` on `PATH` and can be slow for large shell/root snapshots; leave it disabled unless shell rollback is worth the latency.
-- Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
+- Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, complex subshells, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
 - Ignored or unreadable files are excluded from root snapshots unless they were directly journaled by a native file tool; other Git failures still fail closed.
-- Snapshot trees are pinned against Git garbage collection, but automatic snapshot pruning is not implemented yet.
+- Snapshot trees are pinned against Git garbage collection, but automatic snapshot pruning is not implemented yet. Content-addressed blobs accumulate in `~/.pi/agent/rollback-snapshots/blobs/` without automatic GC.
+- File attributes such as setuid/setgid bits, POSIX ACLs, extended attributes (xattr), and directory permission bits are not tracked or restored.
+- File restore operates strictly on regular files; restoring a path that has since been converted to a directory is refused to prevent unintended data loss.

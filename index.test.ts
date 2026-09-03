@@ -1,12 +1,12 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import rollbackExtension, { capture, parseRollbackArgs, restore, ROLLBACK_RESULT_EVENT, sessionStore, snapshotDir } from "./index.js";
-import { bashPathHints, isHcomSandbox, mutationPaths } from "./journal.js";
+import { bashPathHints, captureFileState, isHcomSandbox, mutationPaths, restoreFileState } from "./journal.js";
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -404,9 +404,10 @@ test("sandbox detection uses canonical active modes and path filtering", () => {
 });
 
 test("path hints include quoted POSIX and Windows absolute arguments", () => {
-  assert.ok(bashPathHints('printf changed > "/outside root/demo.txt"', "/work").includes("/outside root/demo.txt"));
+  assert.ok(bashPathHints('printf changed > "/outside root/demo.txt"', "/work", "linux").includes("/outside root/demo.txt"));
   const windowsPath = win32.normalize("C:\\outside root\\demo.txt");
-  assert.ok(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work").includes(windowsPath));
+  assert.ok(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work", "win32").includes(windowsPath));
+  assert.equal(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work", "linux").includes(windowsPath), false);
 });
 test("run-count rollback crosses intervening automatic turn checkpoints and publishes a result", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-entry-"));
@@ -487,4 +488,76 @@ test("registers mutation hooks and commands", () => {
   assert.deepEqual(Object.keys(run.handlers), ["tool_call", "agent_start", "turn_start", "turn_end", "agent_settled"]);
   assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback", "redo"]);
   assert.deepEqual(run.tools, ["rollback"]);
+});
+
+test("capture succeeds even when a stale index.lock exists", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-lock-"));
+  const gitDir = snapshotDir(cwd);
+  cleanup.push(cwd, gitDir);
+  mkdirSync(gitDir, { recursive: true });
+  writeFileSync(join(gitDir, "index.lock"), "stale lock\n");
+  writeFileSync(join(cwd, "demo.txt"), "hello\n");
+  const pi = mockPi();
+  const tree = await capture(pi, cwd);
+  assert.ok(typeof tree === "string" && tree.length > 0);
+  assert.equal(existsSync(join(gitDir, "index.lock")), false);
+});
+
+test("concurrent capture calls on the same storeBase serialize cleanly", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-concurrent-"));
+  const gitDir = snapshotDir(cwd);
+  cleanup.push(cwd, gitDir);
+  writeFileSync(join(cwd, "demo.txt"), "hello\n");
+  const pi = mockPi();
+  const [tree1, tree2] = await Promise.all([
+    capture(pi, cwd),
+    capture(pi, cwd),
+  ]);
+  assert.equal(tree1, tree2);
+  assert.ok(tree1.length > 0);
+});
+
+test("restoreFileState refuses to recursively delete a directory for missing state", () => {
+  const base = mkdtempSync(join(tmpdir(), "pi-rollback-missing-dir-"));
+  const dir = join(base, "untracked-dir");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "critical.txt"), "precious data\n");
+  cleanup.push(base);
+
+  assert.throws(() => restoreFileState(dir, { kind: "missing" }), /Refusing to remove directory/);
+  assert.equal(readFileSync(join(dir, "critical.txt"), "utf8"), "precious data\n");
+});
+
+test("excludeNestedStore excludes parent .rollback-snapshots directory in sandbox mode", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-sandbox-exclude-"));
+  cleanup.push(cwd);
+  const run = harness(cwd, { sandboxed: true });
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  const snapshotRoot = join(cwd, ".pi", ".rollback-snapshots");
+  const [sessionHash] = readdirSync(snapshotRoot);
+  assert.ok(sessionHash);
+  const sessionDir = join(snapshotRoot, sessionHash);
+  const [cwdHash] = readdirSync(sessionDir);
+  assert.ok(cwdHash);
+  const excludePath = join(sessionDir, cwdHash, "info", "exclude");
+  assert.ok(existsSync(excludePath));
+  const excludeContent = readFileSync(excludePath, "utf8");
+  assert.ok(excludeContent.includes("/.pi/.rollback-snapshots/"));
+});
+
+test("restoreFileState cleans up temporary file when operation fails", () => {
+  const base = mkdtempSync(join(tmpdir(), "pi-rollback-temp-cleanup-"));
+  cleanup.push(base);
+  const source = join(base, "source.txt");
+  writeFileSync(source, "content\n");
+  const state = captureFileState(source);
+
+  const targetDir = join(base, "as-file");
+  writeFileSync(targetDir, "i-am-a-file\n");
+  const invalidPath = join(targetDir, "nested", "file.txt");
+  assert.throws(() => restoreFileState(invalidPath, state));
+
+  const files = readdirSync(base);
+  assert.equal(files.some((f) => f.includes("pi-rollback")), false);
 });

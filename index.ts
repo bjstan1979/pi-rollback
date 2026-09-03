@@ -121,6 +121,24 @@ export function snapshotDir(cwd: string, storeBase = SNAPSHOT_ROOT): string {
 export function sessionStore(sessionId: string): string {
   return join(SNAPSHOT_ROOT, "sessions", safeHash(sessionId));
 }
+const storeQueues = new Map<string, Promise<void>>();
+
+export function withStoreLock<T>(storeBase: string, fn: () => Promise<T>): Promise<T> {
+  const prev = storeQueues.get(storeBase) ?? Promise.resolve();
+  let release: () => void;
+  const barrier = new Promise<void>((r) => { release = r; });
+  storeQueues.set(storeBase, barrier);
+
+  return prev
+    .catch(() => {})
+    .then(fn)
+    .finally(() => {
+      release();
+      if (storeQueues.get(storeBase) === barrier) {
+        storeQueues.delete(storeBase);
+      }
+    });
+}
 
 function sandboxStore(cwd: string, sessionId: string): string {
   return join(cwd, ".pi", ".rollback-snapshots", safeHash(sessionId));
@@ -134,24 +152,28 @@ async function git(pi: ExtensionAPI, cwd: string, args: string[]): Promise<strin
 
 function excludeNestedStore(root: string, gitDir: string): void {
   const exclusions: string[] = [];
-  for (const candidate of [gitDir, SNAPSHOT_ROOT]) {
+  for (const candidate of [gitDir, dirname(gitDir), dirname(dirname(gitDir)), SNAPSHOT_ROOT]) {
     const scoped = relative(root, candidate);
     if (scoped && !scoped.startsWith("..") && !isAbsolute(scoped)) exclusions.push(`/${scoped.replaceAll("\\", "/")}/`);
   }
-  if (!exclusions.length) return;
+  const unique = [...new Set(exclusions)];
+  if (!unique.length) return;
   mkdirSync(join(gitDir, "info"), { recursive: true, mode: 0o700 });
-  writeFileSync(join(gitDir, "info", "exclude"), `${exclusions.join("\n")}\n`, { mode: 0o600 });
+  writeFileSync(join(gitDir, "info", "exclude"), `${unique.join("\n")}\n`, { mode: 0o600 });
 }
 
 async function stageSnapshot(pi: ExtensionAPI, cwd: string, gitDir: string): Promise<void> {
+  try {
+    rmSync(join(gitDir, "index.lock"), { force: true });
+  } catch {}
   await git(pi, cwd, ["--git-dir", gitDir, "read-tree", "--empty"]);
   const result = await pi.exec("git", ["--git-dir", gitDir, "--work-tree", cwd, "add", "--all", "--ignore-errors", "--", "."], { cwd, timeout: 30_000 });
   if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr.trim() || "git add failed");
 }
 
-export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHOT_ROOT): Promise<string> {
+async function captureInternal(pi: ExtensionAPI, cwd: string, storeBase: string): Promise<string> {
   const gitDir = snapshotDir(cwd, storeBase);
-  if (!existsSync(gitDir)) {
+  if (!existsSync(gitDir) || !existsSync(join(gitDir, "HEAD"))) {
     mkdirSync(gitDir, { recursive: true, mode: 0o700 });
     await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "init"]);
   }
@@ -163,11 +185,16 @@ export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHO
   return tree;
 }
 
+export async function capture(pi: ExtensionAPI, cwd: string, storeBase = SNAPSHOT_ROOT): Promise<string> {
+  return withStoreLock(storeBase, () => captureInternal(pi, cwd, storeBase));
+}
+
 async function changedPaths(pi: ExtensionAPI, cwd: string, from: string, to: string, storeBase: string): Promise<string[]> {
   const gitDir = snapshotDir(cwd, storeBase);
   const output = await git(pi, cwd, ["--git-dir", gitDir, "diff", "--name-only", "-z", "--no-renames", from, to, "--", "."]);
   return output.split("\0").filter(Boolean);
 }
+
 async function treeHasPath(pi: ExtensionAPI, cwd: string, tree: string, path: string, storeBase: string): Promise<boolean> {
   const gitDir = snapshotDir(cwd, storeBase);
   const output = await git(pi, cwd, ["--git-dir", gitDir, "ls-tree", "-r", "-z", "--name-only", tree, "--", path]);
@@ -191,13 +218,13 @@ async function restoreTree(pi: ExtensionAPI, cwd: string, target: string, from: 
   return paths.length;
 }
 
-export async function restore(
+async function restoreInternal(
   pi: ExtensionAPI,
   cwd: string,
   target: string,
-  storeBase = SNAPSHOT_ROOT,
+  storeBase: string,
 ): Promise<{ files: number; before: string }> {
-  const current = await capture(pi, cwd, storeBase);
+  const current = await captureInternal(pi, cwd, storeBase);
   try {
     return { files: await restoreTree(pi, cwd, target, current, storeBase), before: current };
   } catch (restoreError) {
@@ -208,6 +235,15 @@ export async function restore(
     }
     throw restoreError;
   }
+}
+
+export async function restore(
+  pi: ExtensionAPI,
+  cwd: string,
+  target: string,
+  storeBase = SNAPSHOT_ROOT,
+): Promise<{ files: number; before: string }> {
+  return withStoreLock(storeBase, () => restoreInternal(pi, cwd, target, storeBase));
 }
 
 function activeEntries(ctx: CheckpointContext): SessionEntry[] {
