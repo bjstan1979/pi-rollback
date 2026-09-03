@@ -36,7 +36,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; sendUserMessageError?: Error } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; sendUserMessageError?: Error } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -97,14 +97,18 @@ function harness(cwd: string, options: { sandboxed?: boolean; sendUserMessageErr
   };
   const oldMode = process.env.HCOM_WORKER_SANDBOX;
   const oldRoot = process.env.HCOM_WORKER_SANDBOX_ROOT;
+  const oldDeepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING;
   if (options.sandboxed) process.env.HCOM_WORKER_SANDBOX = "workspace";
   else delete process.env.HCOM_WORKER_SANDBOX;
+  if (options.deepTracking) process.env.PI_ROLLBACK_DEEP_TRACKING = "1";
+  else delete process.env.PI_ROLLBACK_DEEP_TRACKING;
   delete process.env.HCOM_WORKER_SANDBOX_ROOT;
   try {
     rollbackExtension(pi);
   } finally {
     if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
     if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
+    if (oldDeepTracking === undefined) delete process.env.PI_ROLLBACK_DEEP_TRACKING; else process.env.PI_ROLLBACK_DEEP_TRACKING = oldDeepTracking;
   }
   return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo, activeEntries: branch };
 }
@@ -297,7 +301,7 @@ test("preserves the agent-written checkpoint when an external edit happens later
   cleanup.push(cwd, external, snapshotDir(cwd), snapshotDir(external));
   const file = join(external, "demo.txt");
   writeFileSync(file, "original\n");
-  const run = harness(cwd);
+  const run = harness(cwd, { deepTracking: true });
 
   await run.handlers.agent_start!({}, run.ctx);
   await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
@@ -318,7 +322,7 @@ test("tracks a bash mutation in another project root", async () => {
   cleanup.push(cwd, external, snapshotDir(cwd), snapshotDir(external));
   const file = join(external, "demo.txt");
   writeFileSync(file, "bash original\n");
-  const run = harness(cwd);
+  const run = harness(cwd, { deepTracking: true });
 
   await run.handlers.agent_start!({}, run.ctx);
   await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
@@ -328,6 +332,44 @@ test("tracks a bash mutation in another project root", async () => {
 
   await run.commands.rollback!("1", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "bash original\n");
+});
+
+test("turn start never rescans historical shell roots", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-turn-cwd-"));
+  const external = mkdtempSync(join(tmpdir(), "pi-rollback-turn-external-"));
+  cleanup.push(cwd, external, snapshotDir(cwd), snapshotDir(external));
+  const file = join(external, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd, { deepTracking: true });
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: `cd ${external} && printf changed > demo.txt` } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  const rootCount = run.entries.filter((entry) => entry.data?.kind === "root").length;
+
+  writeFileSync(file, "external\n");
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  assert.equal(run.entries.filter((entry) => entry.data?.kind === "root").length, rootCount);
+});
+
+test("shell snapshots are disabled by default", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-shell-default-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "printf changed > demo.txt" } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  await run.commands.rollback!("1", run.ctx);
+
+  assert.equal(readFileSync(file, "utf8"), "changed\n");
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), false);
 });
 
 test("sandbox mode snapshots cwd only and stores its shadow repo inside cwd", async () => {

@@ -48,8 +48,8 @@ Rollback never deletes later checkpoints; they remain on the original inactive b
 
 - `write`, `edit`, `undo_last_edit`, and `ts_morph` are journaled by their actual canonical file path, including paths outside Pi's cwd.
 - File contents are deduplicated in `~/.pi/agent/rollback-snapshots/blobs/`.
-- Bash/PowerShell use session-isolated shadow-Git snapshots for cwd, previously touched project roots, and roots inferred from `cd`, `git -C`, and POSIX or Windows absolute path arguments.
-- Later external edits to known files/roots are recorded at the next turn boundary, preserving the prior agent-written state.
+- Bash/PowerShell full-tree snapshots are disabled by default so turn submission never blocks on large or historical roots.
+- Set `PI_ROLLBACK_DEEP_TRACKING=1` before starting Pi to opt into shell snapshots for cwd and roots inferred from the current command, plus next-turn checks for directly journaled files. Historical shell roots are never rescanned at turn boundaries.
 
 ### HCOM sandbox
 
@@ -69,7 +69,7 @@ Detected only when `HCOM_WORKER_SANDBOX` is `workspace` or `podman-workspace`; `
 
 ## Limits
 
-- Requires `git` on `PATH` for shell/root snapshots.
+- `PI_ROLLBACK_DEEP_TRACKING=1` requires `git` on `PATH` and can be slow for large shell/root snapshots; leave it disabled unless shell rollback is worth the latency.
 - Arbitrary shell side effects cannot be inferred perfectly. Commands using dynamic environment variables, generated paths, databases, services, network resources, or files outside detected roots may not be recoverable.
 - Ignored or unreadable files are excluded from root snapshots unless they were directly journaled by a native file tool; other Git failures still fail closed.
 - Snapshot trees are pinned against Git garbage collection, but automatic snapshot pruning is not implemented yet.

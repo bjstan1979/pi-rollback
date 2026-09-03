@@ -399,10 +399,10 @@ async function assertRedoGuards(pi: ExtensionAPI, redo: RedoRecord): Promise<voi
 
 export default function rollbackExtension(pi: ExtensionAPI): void {
   const sandboxed = isHcomSandbox();
+  const deepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING === "1";
   let agentRun = 0;
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
-  const trackedRoots = new Set<string>();
 
   const flushPending = async (ctx: CheckpointContext): Promise<void> => {
     for (const item of pendingFiles.values()) {
@@ -428,27 +428,15 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   const captureExternalChanges = async (ctx: CheckpointContext): Promise<void> => {
     if (sandboxed) return;
     const latestFiles = new Map<string, FileState>();
-    const latestRoots = new Map<string, RootMutation>();
     for (const item of mutations(ctx)) {
       if (item.kind === "file") latestFiles.set(item.path, item.after);
-      else latestRoots.set(item.root, item);
     }
     for (const [path, before] of latestFiles) {
       try {
-        addRoot(trackedRoots, await projectRoot(pi, path));
         const after = captureFileState(path);
         if (!sameFileState(before, after)) appendMutation(pi, ctx, { kind: "file", path, before, after, source: "external" });
       } catch (error) {
         notify(ctx, `Rollback could not inspect ${path}: ${String(error)}`);
-      }
-    }
-    for (const item of latestRoots.values()) {
-      try {
-        addRoot(trackedRoots, item.root);
-        const after = await capture(pi, item.root, item.storeBase);
-        if (item.after !== after) appendMutation(pi, ctx, { kind: "root", root: item.root, before: item.after, after, storeBase: item.storeBase, source: "external" });
-      } catch (error) {
-        notify(ctx, `Rollback could not inspect ${item.root}: ${String(error)}`);
       }
     }
   };
@@ -458,14 +446,12 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
     try {
       for (const path of mutationPaths(event.toolName, event.input, ctx.cwd, false)) {
         if (!pendingFiles.has(path)) pendingFiles.set(path, { path, before: captureFileState(path) });
-        addRoot(trackedRoots, await projectRoot(pi, path));
       }
-      if (event.toolName !== "bash" && event.toolName !== "powershell") return;
+      if ((event.toolName !== "bash" && event.toolName !== "powershell") || !deepTracking) return;
       const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : {};
       const command = typeof input.command === "string" ? input.command : "";
       const roots = new Set<string>();
       addRoot(roots, ctx.cwd);
-      for (const root of trackedRoots) addRoot(roots, root);
       for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)));
       for (const root of roots) {
         if (pendingRoots.has(root)) continue;
@@ -484,7 +470,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   pi.on("turn_start", async (event, ctx) => {
     try {
       await flushPending(ctx);
-      await captureExternalChanges(ctx);
+      if (deepTracking) await captureExternalChanges(ctx);
       await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
