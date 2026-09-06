@@ -5,12 +5,64 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import rollbackExtension, { capture, parseRollbackArgs, restore, ROLLBACK_RESULT_EVENT, sessionStore, snapshotDir } from "./index.js";
-import { bashPathHints, captureFileState, isHcomSandbox, mutationPaths, restoreFileState } from "./journal.js";
+import rollbackExtension, {
+  capture as captureSnapshot,
+  parseRollbackArgs,
+  restore as restoreSnapshot,
+  ROLLBACK_RESULT_EVENT,
+  safeHash,
+  sessionStore as sessionSnapshotStore,
+  snapshotDir as snapshotDirectory,
+} from "./index.js";
+import {
+  bashPathHints,
+  captureFileState as captureState,
+  isHcomSandbox,
+  mutationPaths,
+  restoreFileState as restoreState,
+  type FileState,
+} from "./journal.js";
 
 const cleanup: string[] = [];
+const testLayouts = new Map<string, string>();
+
+function testLayout(name = "default"): string {
+  let path = testLayouts.get(name);
+  if (!path) {
+    path = mkdtempSync(join(tmpdir(), "pi-rollback-test-store-"));
+    testLayouts.set(name, path);
+    cleanup.push(path);
+  }
+  return path;
+}
+
+function snapshotDir(cwd: string, storeBase = testLayout()): string {
+  return snapshotDirectory(cwd, storeBase);
+}
+
+function sessionStore(sessionId: string): string {
+  return sessionSnapshotStore(sessionId, testLayout("sessions"));
+}
+
+function capture(pi: ExtensionAPI, cwd: string, storeBase = testLayout()): Promise<string> {
+  return captureSnapshot(pi, cwd, storeBase);
+}
+
+function restore(pi: ExtensionAPI, cwd: string, target: string, storeBase = testLayout()): Promise<{ files: number; before: string }> {
+  return restoreSnapshot(pi, cwd, target, storeBase);
+}
+
+function captureFileState(path: string): FileState {
+  return captureState(path, testLayout("blobs"));
+}
+
+function restoreFileState(path: string, state: FileState): void {
+  restoreState(path, state, testLayout("blobs"));
+}
+
 afterEach(() => {
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
+  testLayouts.clear();
 });
 test("parses human-friendly rollback commands and retains JSON compatibility", () => {
   assert.deepEqual(parseRollbackArgs("before-refactor"), { targetLabel: "before-refactor" });
@@ -36,7 +88,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; sendUserMessageError?: Error } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown> } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -98,19 +150,39 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
   const oldMode = process.env.HCOM_WORKER_SANDBOX;
   const oldRoot = process.env.HCOM_WORKER_SANDBOX_ROOT;
   const oldDeepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING;
+  const pruneRoot = mkdtempSync(join(tmpdir(), "pi-rollback-harness-store-"));
+  cleanup.push(pruneRoot);
+  if (options.pruneSettings) writeFileSync(join(pruneRoot, "settings.json"), JSON.stringify(options.pruneSettings));
+  const pruneEnvNames = [
+    "PI_ROLLBACK_PRUNE",
+    "PI_ROLLBACK_RETENTION_DAYS",
+    "PI_ROLLBACK_MAX_STORE_GB",
+    "PI_ROLLBACK_PRUNE_INTERVAL_HOURS",
+    "PI_ROLLBACK_MIGRATION_GRACE_DAYS",
+  ] as const;
+  const oldPruneEnv = new Map(pruneEnvNames.map((name) => [name, process.env[name]]));
+  for (const name of pruneEnvNames) delete process.env[name];
   if (options.sandboxed) process.env.HCOM_WORKER_SANDBOX = "workspace";
   else delete process.env.HCOM_WORKER_SANDBOX;
   if (options.deepTracking) process.env.PI_ROLLBACK_DEEP_TRACKING = "1";
   else delete process.env.PI_ROLLBACK_DEEP_TRACKING;
   delete process.env.HCOM_WORKER_SANDBOX_ROOT;
   try {
-    rollbackExtension(pi);
+    rollbackExtension(pi, {
+      normalLayoutRoot: pruneRoot,
+      blobRoot: testLayout("blobs"),
+      pruneSettingsPath: join(pruneRoot, "settings.json"),
+    });
   } finally {
     if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
     if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
     if (oldDeepTracking === undefined) delete process.env.PI_ROLLBACK_DEEP_TRACKING; else process.env.PI_ROLLBACK_DEEP_TRACKING = oldDeepTracking;
+    for (const name of pruneEnvNames) {
+      const value = oldPruneEnv.get(name);
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
   }
-  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, navigatedTo: () => navigatedTo, activeEntries: branch };
+  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, pruneRoot, navigatedTo: () => navigatedTo, activeEntries: branch };
 }
 
 test("root snapshot restores files without touching the project git index", async () => {
@@ -384,6 +456,10 @@ test("sandbox mode snapshots cwd only and stores its shadow repo inside cwd", as
   writeFileSync(file, "sandbox changed\n");
   await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
   assert.equal(existsSync(join(cwd, ".pi", ".rollback-snapshots")), true);
+  const sandboxRoot = join(cwd, ".pi", ".rollback-snapshots");
+  const session = readdirSync(sandboxRoot).find((name) => /^[0-9a-f]{24}$/.test(name));
+  const activity = JSON.parse(readFileSync(join(sandboxRoot, session!, ".activity.json"), "utf8"));
+  assert.equal(typeof activity.lastUsedAt, "number");
 
   await run.commands.rollback!("1", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "sandbox original\n");
@@ -485,9 +561,80 @@ test("registers mutation hooks and commands", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-register-"));
   cleanup.push(cwd);
   const run = harness(cwd);
-  assert.deepEqual(Object.keys(run.handlers), ["tool_call", "agent_start", "turn_start", "turn_end", "agent_settled"]);
-  assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback", "redo"]);
+  assert.deepEqual(Object.keys(run.handlers), ["tool_call", "session_start", "session_shutdown", "agent_start", "turn_start", "turn_end", "agent_settled"]);
+  assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback-prune", "rollback", "redo"]);
   assert.deepEqual(run.tools, ["rollback"]);
+});
+test("global settings can disable pruning without environment variables", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-settings-"));
+  cleanup.push(cwd);
+  const run = harness(cwd, { pruneSettings: { PI_ROLLBACK_PRUNE: false } });
+  await run.handlers.session_start!({}, run.ctx);
+  await run.commands["rollback-prune"]!("", run.ctx);
+  assert.match(run.notifications.at(-1)!, /disabled by PI_ROLLBACK_PRUNE=0/);
+  assert.equal(existsSync(join(run.pruneRoot, ".last-prune.json")), false);
+});
+
+
+test("normal lifecycle protects its session and exposes immediate pruning", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-lifecycle-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+  await run.handlers.session_start!({}, run.ctx);
+  const leaseDir = join(run.pruneRoot, ".leases");
+  const leases = readdirSync(leaseDir);
+  assert.equal(leases.length, 1);
+  const lease = JSON.parse(readFileSync(join(leaseDir, leases[0]!), "utf8"));
+  assert.equal(lease.candidate, `sessions/${safeHash("session-test")}`);
+
+  await run.commands["rollback-prune"]!("", run.ctx);
+  assert.match(run.notifications.at(-1)!, /reclaimed 0 byte\(s\)/);
+  await run.handlers.session_shutdown!({}, run.ctx);
+  assert.deepEqual(readdirSync(leaseDir), []);
+});
+
+test("lifecycle leases every snapshot store referenced anywhere in the session", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-referenced-store-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+  const parentStore = join(run.pruneRoot, "sessions", "a".repeat(24));
+  const legacyRoot = "/legacy/project";
+  run.entries.push({
+    id: "parent-root-mutation",
+    type: "custom",
+    customType: "pi-rollback-mutation",
+    parentId: null,
+    data: { version: 2, kind: "root", seq: 1, root: "/parent/project", before: "a", after: "b", storeBase: parentStore, source: "bash", createdAt: 0 },
+  });
+  run.entries.push({
+    id: "legacy-root-mutation",
+    type: "custom",
+    customType: "pi-rollback-mutation",
+    parentId: null,
+    data: { version: 2, kind: "root", seq: 2, root: legacyRoot, before: "a", after: "b", storeBase: run.pruneRoot, source: "bash", createdAt: 0 },
+  });
+
+  await run.handlers.session_start!({}, run.ctx);
+  const candidates = readdirSync(join(run.pruneRoot, ".leases"))
+    .map((name) => JSON.parse(readFileSync(join(run.pruneRoot, ".leases", name), "utf8")).candidate)
+    .sort();
+  assert.deepEqual(candidates, [
+    safeHash(legacyRoot),
+    `sessions/${"a".repeat(24)}`,
+    `sessions/${safeHash("session-test")}`,
+  ].sort());
+});
+
+test("tool calls fail closed when snapshot protection cannot be established", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-protection-failure-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+  mkdirSync(join(run.pruneRoot, ".prune-lock"));
+  writeFileSync(join(run.pruneRoot, ".prune-lock", "owner.json"), "{}\n");
+  await assert.rejects(
+    run.handlers.tool_call!({ toolName: "write", input: { path: join(cwd, "demo.txt") } }, run.ctx),
+    /refusing snapshot access/,
+  );
 });
 
 test("capture succeeds even when a stale index.lock exists", async () => {
@@ -535,10 +682,10 @@ test("excludeNestedStore excludes parent .rollback-snapshots directory in sandbo
   await run.handlers.agent_start!({}, run.ctx);
   await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
   const snapshotRoot = join(cwd, ".pi", ".rollback-snapshots");
-  const [sessionHash] = readdirSync(snapshotRoot);
+  const [sessionHash] = readdirSync(snapshotRoot).filter((name) => /^[0-9a-f]{24}$/.test(name));
   assert.ok(sessionHash);
   const sessionDir = join(snapshotRoot, sessionHash);
-  const [cwdHash] = readdirSync(sessionDir);
+  const [cwdHash] = readdirSync(sessionDir).filter((name) => /^[0-9a-f]{24}$/.test(name));
   assert.ok(cwdHash);
   const excludePath = join(sessionDir, cwdHash, "info", "exclude");
   assert.ok(existsSync(excludePath));

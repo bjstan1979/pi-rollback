@@ -1,6 +1,6 @@
 {
   "name": "pi-rollback",
-  "version": "0.3.5",
+  "version": "0.4.1",
   "description": "Branch-aware conversation and workspace rollback for Pi",
   "type": "module",
   "license": "MIT",
@@ -21,6 +21,7 @@
   "files": [
     "index.ts",
     "journal.ts",
+    "prune.ts",
     "README.md",
     "LICENSE"
   ],
@@ -30,7 +31,7 @@
     ]
   },
   "scripts": {
-    "test": "bun test index.test.ts",
+    "test": "bun test index.test.ts prune.test.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "peerDependencies": {

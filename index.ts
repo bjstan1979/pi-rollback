@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   bashPathHints,
@@ -16,6 +16,24 @@ import {
   restoreFileState,
   sameFileState,
 } from "./journal.js";
+import {
+  assertSafeLayoutRoot,
+  createLease,
+  parsePruneConfig,
+  readPruneSettings,
+  pruneSnapshots,
+  readLastPruneAt,
+  refreshLease,
+  releaseLease,
+  touchActivity,
+  touchLastPruneAt,
+  validCandidateRelative,
+  type LeaseHandle,
+  type PruneDependencies,
+  type PruneMode,
+  type PruneConfig,
+  type PruneReport,
+} from "./prune.js";
 
 const CHECKPOINT_TYPE = "pi-rollback-checkpoint";
 const MUTATION_TYPE = "pi-rollback-mutation";
@@ -111,15 +129,15 @@ type CheckpointContext = Pick<ExtensionCommandContext, "sessionManager" | "cwd" 
 type PendingFile = { path: string; before: FileState };
 type PendingRoot = { root: string; before: string; storeBase: string };
 
-function safeHash(value: string): string {
+export function safeHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
 export function snapshotDir(cwd: string, storeBase = SNAPSHOT_ROOT): string {
   return join(storeBase, safeHash(cwd));
 }
-export function sessionStore(sessionId: string): string {
-  return join(SNAPSHOT_ROOT, "sessions", safeHash(sessionId));
+export function sessionStore(sessionId: string, layoutRoot = SNAPSHOT_ROOT): string {
+  return join(layoutRoot, "sessions", safeHash(sessionId));
 }
 const storeQueues = new Map<string, Promise<void>>();
 
@@ -182,6 +200,7 @@ async function captureInternal(pi: ExtensionAPI, cwd: string, storeBase: string)
   await stageSnapshot(pi, cwd, gitDir);
   const tree = await git(pi, cwd, ["--git-dir", gitDir, "write-tree"]);
   await git(pi, cwd, ["--git-dir", gitDir, "update-ref", `refs/pi-rollback/trees/${tree}`, tree]);
+  touchActivity(/^[0-9a-f]{24}$/.test(storeBase.split(/[\\/]/).at(-1) ?? "") ? storeBase : gitDir);
   return tree;
 }
 
@@ -401,21 +420,21 @@ function addRoot(roots: Set<string>, root: string): void {
   roots.add(absolute);
 }
 
-async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before" | "after", sandboxed: boolean, cwd: string): Promise<number> {
+async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before" | "after", sandboxed: boolean, cwd: string, blobRoot?: string): Promise<number> {
   if (mutation.kind === "file") {
     if (sandboxed && !isWithin(cwd, mutation.path)) throw new Error(`Sandbox rollback refused external path: ${mutation.path}`);
-    restoreFileState(mutation.path, mutation[side]);
+    restoreFileState(mutation.path, mutation[side], blobRoot);
     return 1;
   }
   if (sandboxed && resolve(mutation.root) !== resolve(cwd)) throw new Error(`Sandbox rollback refused external root: ${mutation.root}`);
   return (await restore(pi, mutation.root, mutation[side], mutation.storeBase)).files;
 }
 
-async function captureRedoGuards(pi: ExtensionAPI, selected: Mutation[]): Promise<Pick<RedoRecord, "fileGuards" | "rootGuards">> {
+async function captureRedoGuards(pi: ExtensionAPI, selected: Mutation[], blobRoot?: string): Promise<Pick<RedoRecord, "fileGuards" | "rootGuards">> {
   const files = new Map<string, FileState>();
   const roots = new Map<string, RootState>();
   for (const mutation of selected) {
-    if (mutation.kind === "file") files.set(mutation.path, captureFileState(mutation.path));
+    if (mutation.kind === "file") files.set(mutation.path, captureFileState(mutation.path, blobRoot));
     else roots.set(mutation.root, { root: mutation.root, tree: await capture(pi, mutation.root, mutation.storeBase), storeBase: mutation.storeBase });
   }
   return {
@@ -423,27 +442,130 @@ async function captureRedoGuards(pi: ExtensionAPI, selected: Mutation[]): Promis
     rootGuards: [...roots.values()],
   };
 }
-
-async function assertRedoGuards(pi: ExtensionAPI, redo: RedoRecord): Promise<void> {
+async function assertRedoGuards(pi: ExtensionAPI, redo: RedoRecord, blobRoot?: string): Promise<void> {
   for (const guard of redo.fileGuards ?? []) {
-    if (!sameFileState(captureFileState(guard.path), guard.state)) throw new Error(`Redo unavailable because ${guard.path} changed after rollback`);
+    if (!sameFileState(captureFileState(guard.path, blobRoot), guard.state)) throw new Error(`Redo unavailable because ${guard.path} changed after rollback`);
   }
   for (const guard of redo.rootGuards ?? []) {
     if (await capture(pi, guard.root, guard.storeBase) !== guard.tree) throw new Error(`Redo unavailable because ${guard.root} changed after rollback`);
   }
 }
+export interface RollbackExtensionOptions {
+  normalLayoutRoot?: string;
+  pruneDependencies?: PruneDependencies;
+  blobRoot?: string;
+  pruneSettingsPath?: string;
+  pruneEnv?: NodeJS.ProcessEnv;
+}
 
-export default function rollbackExtension(pi: ExtensionAPI): void {
+export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExtensionOptions = {}): void {
   const sandboxed = isHcomSandbox();
   const deepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING === "1";
+  const normalLayoutRoot = options.normalLayoutRoot ?? SNAPSHOT_ROOT;
+  const pruneSettings = readPruneSettings(options.pruneSettingsPath ?? join(getAgentDir(), "settings.json"));
+  const pruneConfig: PruneConfig = pruneSettings.warning
+    ? { ...parsePruneConfig({ PI_ROLLBACK_PRUNE: "0" }), warning: pruneSettings.warning }
+    : parsePruneConfig(options.pruneEnv ?? process.env, pruneSettings.settings);
+  let pruneWarningShown = false;
+  let lastPruneAt: number | undefined;
+  const leases = new Map<string, LeaseHandle>();
   let agentRun = 0;
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
 
+  const layoutFor = (ctx: CheckpointContext): { root: string; mode: PruneMode; candidate: string } => {
+    const sessionHash = safeHash(ctx.sessionManager.getSessionId());
+    if (sandboxed) {
+      const root = join(ctx.cwd, ".pi", ".rollback-snapshots");
+      assertSafeLayoutRoot(root, ctx.cwd);
+      return { root, mode: "sandbox", candidate: sessionHash };
+    }
+    assertSafeLayoutRoot(normalLayoutRoot);
+    return { root: normalLayoutRoot, mode: "normal", candidate: `sessions/${sessionHash}` };
+  };
+
+  const referencedCandidates = (ctx: CheckpointContext, layout: ReturnType<typeof layoutFor>): Set<string> => {
+    const referenced = new Set<string>([layout.candidate]);
+    const addStore = (storeBase: unknown, root?: unknown): void => {
+      if (typeof storeBase !== "string") return;
+      const absoluteStore = resolve(storeBase);
+      let candidate = relative(layout.root, absoluteStore).replaceAll("\\", "/");
+      if (layout.mode === "normal" && candidate === "" && typeof root === "string") candidate = safeHash(root);
+      if (validCandidateRelative(layout.mode, candidate)) referenced.add(candidate);
+    };
+    for (const entry of ctx.sessionManager.getEntries() as SessionEntry[]) {
+      if (entry.type !== "custom" || !entry.data || typeof entry.data !== "object") continue;
+      if (entry.customType === MUTATION_TYPE) {
+        const mutation = entry.data as Partial<RootMutation>;
+        if (mutation.kind === "root") addStore(mutation.storeBase, mutation.root);
+      } else if (entry.customType === CHECKPOINT_TYPE) {
+        const checkpoint = entry.data as Partial<Checkpoint>;
+        addStore(checkpoint.sandbox?.storeBase, checkpoint.sandbox?.root);
+      } else if (entry.customType === REDO_TYPE) {
+        const redo = entry.data as Partial<RedoRecord>;
+        addStore(redo.sandbox?.storeBase, redo.sandbox?.root);
+        for (const guard of redo.rootGuards ?? []) addStore(guard.storeBase, guard.root);
+        for (const mutation of redo.mutations ?? []) if (mutation.kind === "root") addStore(mutation.storeBase, mutation.root);
+      }
+    }
+    return referenced;
+  };
+
+  const protectCurrent = (ctx: CheckpointContext): void => {
+    const layout = layoutFor(ctx);
+    const desired = referencedCandidates(ctx, layout);
+    for (const [candidate, handle] of [...leases]) {
+      if (handle.layoutRoot === layout.root && desired.has(candidate)) continue;
+      releaseLease(handle);
+      leases.delete(candidate);
+    }
+    for (const candidate of desired) {
+      const handle = leases.get(candidate);
+      leases.set(candidate, handle && handle.layoutRoot === layout.root
+        ? refreshLease(handle, layout.mode, options.pruneDependencies)
+        : createLease(layout.root, layout.mode, candidate, options.pruneDependencies));
+    }
+  };
+
+  const executePrune = (ctx: CheckpointContext, honorInterval: boolean, notifyResult = true): PruneReport | undefined => {
+    protectCurrent(ctx);
+    if (pruneConfig.warning && !pruneWarningShown) {
+      pruneWarningShown = true;
+      notify(ctx, pruneConfig.warning);
+    }
+    if (!pruneConfig.enabled) return undefined;
+    const now = options.pruneDependencies?.now?.() ?? Date.now();
+    const layout = layoutFor(ctx);
+    if (honorInterval) {
+      const previous = Math.max(lastPruneAt ?? 0, readLastPruneAt(layout.root) ?? 0);
+      if (previous > 0 && now - previous < pruneConfig.intervalMs) return undefined;
+    }
+    const report = pruneSnapshots({
+      layoutRoot: layout.root,
+      mode: layout.mode,
+      currentCandidate: layout.candidate,
+      containmentRoot: layout.mode === "sandbox" ? ctx.cwd : undefined,
+      config: pruneConfig,
+      dependencies: options.pruneDependencies,
+    });
+    if (!report.errors.length) {
+      lastPruneAt = now;
+      try {
+        touchLastPruneAt(layout.root, now);
+      } catch (error) {
+        report.errors.push(`Could not record rollback prune completion: ${String(error)}`);
+      }
+    }
+    if (notifyResult && report.bytesRemoved > 0 && ctx.hasUI) {
+      ctx.ui.notify(`Rollback pruning reclaimed ${report.bytesRemoved} byte(s); ${report.remainingBytes} byte(s) remain`, "info");
+    }
+    if (notifyResult && report.errors.length) notify(ctx, `Rollback pruning warning: ${report.errors.join("; ")}`);
+    return report;
+  };
   const flushPending = async (ctx: CheckpointContext): Promise<void> => {
     for (const item of pendingFiles.values()) {
       try {
-        const after = captureFileState(item.path);
+        const after = captureFileState(item.path, options.blobRoot);
         if (!sameFileState(item.before, after)) appendMutation(pi, ctx, { kind: "file", path: item.path, before: item.before, after, source: "tool" });
       } catch (error) {
         notify(ctx, `Rollback could not record ${item.path}: ${String(error)}`);
@@ -469,7 +591,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
     }
     for (const [path, before] of latestFiles) {
       try {
-        const after = captureFileState(path);
+        const after = captureFileState(path, options.blobRoot);
         if (!sameFileState(before, after)) appendMutation(pi, ctx, { kind: "file", path, before, after, source: "external" });
       } catch (error) {
         notify(ctx, `Rollback could not inspect ${path}: ${String(error)}`);
@@ -478,10 +600,11 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("tool_call", async (event, ctx) => {
-    if (sandboxed) return;
+    protectCurrent(ctx);
     try {
+      if (sandboxed) return;
       for (const path of mutationPaths(event.toolName, event.input, ctx.cwd, false)) {
-        if (!pendingFiles.has(path)) pendingFiles.set(path, { path, before: captureFileState(path) });
+        if (!pendingFiles.has(path)) pendingFiles.set(path, { path, before: captureFileState(path, options.blobRoot) });
       }
       if ((event.toolName !== "bash" && event.toolName !== "powershell") || !deepTracking) return;
       const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : {};
@@ -491,11 +614,28 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)));
       for (const root of roots) {
         if (pendingRoots.has(root)) continue;
-        const storeBase = sessionStore(ctx.sessionManager.getSessionId());
+        const storeBase = sessionStore(ctx.sessionManager.getSessionId(), normalLayoutRoot);
         pendingRoots.set(root, { root, before: await capture(pi, root, storeBase), storeBase });
       }
     } catch (error) {
       notify(ctx, `Rollback preflight skipped: ${String(error)}`);
+    }
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      executePrune(ctx, true);
+    } catch (error) {
+      notify(ctx, `Rollback pruning warning: ${String(error)}`);
+    }
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    try {
+      if (pendingFiles.size || pendingRoots.size) await flushPending(ctx);
+    } finally {
+      for (const handle of leases.values()) releaseLease(handle);
+      leases.clear();
     }
   });
 
@@ -505,6 +645,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
 
   pi.on("turn_start", async (event, ctx) => {
     try {
+      protectCurrent(ctx);
       await flushPending(ctx);
       if (deepTracking) await captureExternalChanges(ctx);
       await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed);
@@ -515,6 +656,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
 
   pi.on("turn_end", async (event, ctx) => {
     try {
+      protectCurrent(ctx);
       await flushPending(ctx);
       await saveCheckpoint(pi, ctx, `rollback-after-${agentRun}-${event.turnIndex}`, sandboxed);
     } catch (error) {
@@ -566,7 +708,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       } else {
         try {
           for (const mutation of selected) {
-            files += await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+            files += await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
             reverted.push(mutation);
           }
           redo = {
@@ -576,11 +718,11 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
             targetLabel: target.label,
             mode: "normal",
             mutations: [...selected].reverse(),
-            ...await captureRedoGuards(pi, selected),
+            ...await captureRedoGuards(pi, selected, options.blobRoot),
             createdAt: Date.now(),
           };
         } catch (error) {
-          for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+          for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
           throw error;
         }
       }
@@ -594,12 +736,12 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
         });
       } catch (error) {
         if (sandboxBefore && target.sandbox) await restore(pi, target.sandbox.root, sandboxBefore, target.sandbox.storeBase);
-        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
         throw error;
       }
       if (result.cancelled) {
         if (sandboxBefore && target.sandbox) await restore(pi, target.sandbox.root, sandboxBefore, target.sandbox.storeBase);
-        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
         publishRollbackResult({
           requestId: args.requestId,
           ok: false,
@@ -664,14 +806,14 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
         files += restored.files;
         sandboxBefore = restored.before;
       } else {
-        await assertRedoGuards(pi, redo);
+        await assertRedoGuards(pi, redo, options.blobRoot);
         try {
           for (const mutation of redo.mutations ?? []) {
-            files += await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd);
+            files += await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
             applied.push(mutation);
           }
         } catch (error) {
-          for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+          for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
           throw error;
         }
       }
@@ -681,12 +823,12 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
         result = await ctx.navigateTree(redo.sourceEntryId, { summarize: false });
       } catch (error) {
         if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
-        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
         throw error;
       }
       if (result.cancelled) {
         if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
-        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd);
+        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
         throw new Error("Redo cancelled");
       }
       if (ctx.hasUI) ctx.ui.notify(`Redid ${files} file(s) and restored checkpoint branch ${redo.targetLabel}`, "info");
@@ -696,13 +838,19 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!pendingFiles.size && !pendingRoots.size) return;
-    await flushPending(ctx);
+    try {
+      protectCurrent(ctx);
+      if (pendingFiles.size || pendingRoots.size) await flushPending(ctx);
+      executePrune(ctx, true);
+    } catch (error) {
+      notify(ctx, `Rollback pruning warning: ${String(error)}`);
+    }
   });
 
   pi.registerCommand("checkpoint", {
     description: "Save a rollback checkpoint",
     handler: async (args, ctx) => {
+      protectCurrent(ctx);
       await ctx.waitForIdle();
       await flushPending(ctx);
       await captureExternalChanges(ctx);
@@ -720,10 +868,25 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
       if (ctx.hasUI) ctx.ui.notify(text, "info");
     },
   });
+  pi.registerCommand("rollback-prune", {
+    description: "Run rollback snapshot retention policy now",
+    handler: async (_args, ctx) => {
+      try {
+        const report = executePrune(ctx, false, false);
+        const message = report
+          ? `Rollback pruning reclaimed ${report.bytesRemoved} byte(s); ${report.remainingBytes} byte(s) remain${report.errors.length ? `; warnings: ${report.errors.join("; ")}` : ""}`
+          : pruneConfig.warning ? undefined : "Rollback pruning is disabled by PI_ROLLBACK_PRUNE=0";
+        if (message && ctx.hasUI) ctx.ui.notify(message, report?.errors.length ? "warning" : "info");
+      } catch (error) {
+        notify(ctx, `Rollback pruning warning: ${String(error)}`);
+      }
+    },
+  });
 
   pi.registerCommand("rollback", {
     description: "Restore files and conversation: /rollback <label>|entry:<id>|<count> [-- <continue prompt>]",
     handler: async (raw, ctx) => {
+      protectCurrent(ctx);
       await runRollback(parseRollbackArgs(raw), ctx);
     },
   });
@@ -731,6 +894,7 @@ export default function rollbackExtension(pi: ExtensionAPI): void {
   pi.registerCommand("redo", {
     description: "Redo the most recent rollback if its branch has not advanced",
     handler: async (_raw, ctx) => {
+      protectCurrent(ctx);
       await runRedo(ctx);
     },
   });

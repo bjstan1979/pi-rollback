@@ -20,13 +20,13 @@ export type FileState =
   | { kind: "missing" }
   | { kind: "file"; blob: string; mode: number };
 
-function blobPath(blob: string): string {
-  return join(BLOB_ROOT, blob.slice(0, 2), blob.slice(2));
+function blobPath(blob: string, blobRoot = BLOB_ROOT): string {
+  return join(blobRoot, blob.slice(0, 2), blob.slice(2));
 }
 
-function storeBlob(content: Buffer): string {
+function storeBlob(content: Buffer, blobRoot: string): string {
   const blob = createHash("sha256").update(content).digest("hex");
-  const path = blobPath(blob);
+  const path = blobPath(blob, blobRoot);
   if (!existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     try {
@@ -62,18 +62,18 @@ export function isHcomSandbox(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.HCOM_WORKER_SANDBOX === "workspace" || env.HCOM_WORKER_SANDBOX === "podman-workspace";
 }
 
-export function captureFileState(path: string): FileState {
+export function captureFileState(path: string, blobRoot = BLOB_ROOT): FileState {
   if (!existsSync(path)) return { kind: "missing" };
   const stat = lstatSync(path);
   if (!stat.isFile()) throw new Error(`Rollback supports regular files only: ${path}`);
-  return { kind: "file", blob: storeBlob(readFileSync(path)), mode: stat.mode & 0o777 };
+  return { kind: "file", blob: storeBlob(readFileSync(path), blobRoot), mode: stat.mode & 0o777 };
 }
 
 export function sameFileState(a: FileState, b: FileState): boolean {
   return a.kind === b.kind && (a.kind === "missing" || (b.kind === "file" && a.blob === b.blob && a.mode === b.mode));
 }
 
-export function restoreFileState(path: string, state: FileState): void {
+export function restoreFileState(path: string, state: FileState, blobRoot = BLOB_ROOT): void {
   if (state.kind === "missing") {
     if (existsSync(path)) {
       if (lstatSync(path).isDirectory()) throw new Error(`Refusing to remove directory for missing file state: ${path}`);
@@ -81,7 +81,7 @@ export function restoreFileState(path: string, state: FileState): void {
     }
     return;
   }
-  const content = readFileSync(blobPath(state.blob));
+  const content = readFileSync(blobPath(state.blob, blobRoot));
   if (createHash("sha256").update(content).digest("hex") !== state.blob) throw new Error(`Corrupt rollback blob: ${state.blob}`);
   mkdirSync(dirname(path), { recursive: true });
   const temporary = join(dirname(path), `.${basename(path)}.pi-rollback-${process.pid}-${randomUUID()}`);
