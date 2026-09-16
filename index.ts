@@ -906,7 +906,8 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     promptSnippet: "Roll back conversation and journaled workspace files to an earlier agent run or checkpoint",
     promptGuidelines: [
       "Use rollback when the user asks to undo or roll back your latest agent run; count is run-relative (default 1), while targetLabel/targetEntryId restore explicit checkpoints. The rollback is queued after the current turn, so stop making changes after calling it.",
-      "Do not use rollback merely to fix an ordinary mistake when a direct edit is sufficient. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label>|entry:<id>|<count> [-- <continue prompt>], and /redo.",
+      "You may proactively roll back without waiting for the user when the same failure repeats, attempted fixes begin spreading across files or overwriting earlier work, or evidence shows the current implementation direction is wrong. Prefer rollback over stacking speculative repair patches in those cases.",
+      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label>|entry:<id>|<count> [-- <continue prompt>], and /redo.",
     ],
     parameters: Type.Object({
       targetLabel: Type.Optional(Type.String()),

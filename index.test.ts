@@ -555,6 +555,8 @@ test("LLM rollback tool dispatches the extension command on the follow-up turn",
   }]);
   assert.match(run.toolDefs.rollback.promptSnippet, /conversation and journaled workspace files/);
   assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /count is run-relative/);
+  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /proactively roll back without waiting for the user/);
+  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /isolated mistake with a clear local fix/);
 });
 
 test("registers mutation hooks and commands", () => {
