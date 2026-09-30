@@ -108,3 +108,20 @@ Once an inactive session store is pruned, resuming that old conversation does no
 - Deep-tracking shadow Git operations are serialized only within one Pi process. Running two Pi processes against the same session simultaneously is unsupported; their session leases prevent pruning, but they can still contend on the same Git index.
 - File attributes such as setuid/setgid bits, POSIX ACLs, extended attributes (xattr), and directory permission bits are not tracked or restored.
 - File restore operates strictly on regular files; restoring a path that has since been converted to a directory is refused to prevent unintended data loss.
+
+## External-change reconciliation (0.4.1-local.2)
+
+Files can change outside tool calls: commit formatting hooks (biome, prettier),
+generators, any script. Those writes are invisible to the tool-call journal, so
+a checkpoint's implied file states could silently lag the real disk — a later
+rollback then rewound files to stale pre-hook snapshots and destroyed the
+out-of-band edits (observed 2026-09-30: three source files lost commit-hook
+formatting after `rollback count=1`).
+
+Fix: `captureExternalChanges()` now runs unconditionally at `turn_start` (it
+already ran at `turn_end`/`agent_settled`) and again at the start of every
+rollback, before the target resolves. Every turn boundary therefore reconciles
+the journal with the actual disk first, so checkpoint targets reflect reality
+and out-of-band edits are preserved unless they post-date the chosen
+checkpoint. `PI_ROLLBACK_DEEP_TRACKING` continues to gate only bash/powershell
+root-tree tracking, which it was always meant to gate.

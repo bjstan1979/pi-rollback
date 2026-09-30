@@ -647,7 +647,14 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     try {
       protectCurrent(ctx);
       await flushPending(ctx);
-      if (deepTracking) await captureExternalChanges(ctx);
+      // Reconcile BEFORE the before-checkpoint, unconditionally. Out-of-band
+      // writes (commit formatting hooks, generators, any non-tool writer) land
+      // between turns; reconciling here makes the checkpoint seq reflect the
+      // true on-disk state, so a later rollback can never rewind a file to a
+      // stale pre-hook snapshot. (Previously gated behind deepTracking, which
+      // let commit-hook edits be silently destroyed by rollback — observed on
+      // 2026-09-30 with three 0.99.1 adaptation files.)
+      await captureExternalChanges(ctx);
       await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
@@ -674,6 +681,10 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   const runRollback = async (args: RollbackArgs, ctx: ExtensionCommandContext): Promise<void> => {
     let target: Checkpoint | undefined;
     try {
+      // Defense in depth: reconcile journal with disk before resolving the
+      // target, so the selection covers out-of-band edits made within the
+      // current turn (e.g. a formatting hook firing after the last checkpoint).
+      await captureExternalChanges(ctx);
       if (args.requestId !== undefined && (!args.requestId.trim() || Buffer.byteLength(args.requestId, "utf8") > 128)) {
         throw new Error("Rollback requestId must be 1-128 bytes");
       }
