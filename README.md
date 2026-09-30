@@ -12,20 +12,42 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 
 ## Usage
 
+Checkpoints are saved automatically before and after every model turn, so `1` and `run 1` targets are always available. Name your own checkpoints with free-form text (spaces allowed):
+
 ```text
-/checkpoint before-refactor
+/checkpoint before the big refactor
 /checkpoints
-/rollback 1
-/rollback before-refactor
-/rollback before-refactor -- Try the smaller fix.
-/rollback entry:<session-entry-id>
+/rollback                              # one checkpoint back
+/rollback 3                            # three checkpoints back
+/rollback before the big refactor      # fuzzy label match (case-insensitive)
+/rollback run 2                        # start of the run before last
+/rollback before refactor -- Try the smaller fix.
+/rollback entry:<session-entry-id>     # exact power-user form
 /redo
 /rollback-prune
 ```
 
-For the slash command, a numeric target counts checkpoints, not whole agent runs. Use an explicit label such as `rollback-before-1-0` when you want a specific run boundary.
+Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number or `run <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`). The numeric target counts checkpoints, not whole agent runs.
 
-Pi also exposes an LLM-callable `rollback` tool. Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued. Automatic checkpoints are captured before and after each model turn.
+`/checkpoints` prints a friendly list with relative timestamps and the exact command that restores each entry, including run boundaries:
+
+```text
+Rollback checkpoints (oldest → newest):
+  1. run 1 turn 0 start · auto · 12m ago   (/rollback 4 · /rollback run 1)
+  2. run 1 turn 0 end · auto · 11m ago     (/rollback 3)
+  3. before the big refactor · 9m ago      (/rollback 2)
+  4. run 2 turn 0 start · auto · 4m ago    (/rollback 1 · /rollback run 2)
+Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo
+```
+
+### Agent tools and automatic guards
+
+Pi exposes two LLM-callable tools so agents participate in checkpointing instead of only reacting:
+
+- `checkpoint` — saves a named checkpoint mid-task. Agents are prompted to call it before risky or hard-to-reverse work (bulk edits, migrations, destructive shell commands) and at stable verified states.
+- `rollback` — queues a run-relative rollback (`count`, default 1) or restores an explicit checkpoint (`targetLabel`/`targetEntryId`). Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued.
+
+Additionally, before a plausibly irreversible shell command (`rm`, `git reset --hard`, `git clean`, `git restore`, `find -delete`, `DROP TABLE`, `Remove-Item`, … — once per turn), the extension automatically flushes the journal, saves an `auto-before-destructive-*` checkpoint, and captures a workspace tree baseline. Bash-caused changes are otherwise unjournaled by default; the guard makes that damage revertible with `/rollback destructive`-style label matching even with deep tracking disabled. Set `PI_ROLLBACK_GUARD_DESTRUCTIVE=0` before starting Pi to disable it. Detection is conservative: harmless false positives only cost one checkpoint and snapshot.
 
 ### Extension integration
 
@@ -49,7 +71,7 @@ Rollback never deletes later checkpoints; they remain on the original inactive b
 
 - `write`, `edit`, `undo_last_edit`, and `ts_morph` are journaled by their actual canonical file path, including paths outside Pi's cwd.
 - File contents are deduplicated in `~/.pi/agent/rollback-snapshots/blobs/`.
-- Bash/PowerShell full-tree snapshots are disabled by default so turn submission never blocks on large or historical roots.
+- Bash/PowerShell full-tree snapshots are disabled by default so turn submission never blocks on large or historical roots; plausibly destructive commands are still guarded per turn (see above).
 - Set `PI_ROLLBACK_DEEP_TRACKING=1` before starting Pi to opt into shell snapshots for cwd and roots inferred from the current command, plus next-turn checks for directly journaled files. Historical shell roots are never rescanned at turn boundaries.
 
 ### HCOM sandbox

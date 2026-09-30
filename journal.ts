@@ -105,6 +105,17 @@ export function mutationPaths(toolName: string, input: unknown, cwd: string, san
   return sandboxed && !isWithin(cwd, path) ? [] : [path];
 }
 
+/**
+ * Detect shell commands whose side effects are plausibly irreversible (file
+ * deletion, hard resets, mass table edits). Deliberately conservative: a false
+ * positive only costs one extra checkpoint and snapshot, a false negative loses
+ * data. Plain output redirection (`> file`) is intentionally not destructive
+ * enough to guard.
+ */
+export function isDestructiveCommand(command: string): boolean {
+  return /(?:^|[\s;&|(=])(?:rm|rmdir|shred|unlink)(?:\s|$)|\bfind\b[^\n]*\s-delete(?:\s|$)|\bxargs\b[^\n]*\s(?:rm|rmdir)\b|git\s+(?:reset\s+--hard|clean\b|checkout\s+(?:--|\.)|restore\b|switch\s+--force|branch\s+-D\b)|(?:^|[\s;&|(])\bdd\b[^\n]*\bof=|\b(?:mkfs(?:\.\w+)?|wipefs)\b|\b(?:DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE\s+TABLE|DELETE\s+FROM)\b|\bremove-item\b/i.test(command);
+}
+
 /** Conservative hints only; arbitrary shell side effects cannot be inferred statically. */
 export function bashPathHints(command: string, cwd: string, platform: string = process.platform): string[] {
   const hints = new Set<string>();

@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import rollbackExtension, {
   capture as captureSnapshot,
   parseRollbackArgs,
+  resolveLabelQuery,
   restore as restoreSnapshot,
   ROLLBACK_RESULT_EVENT,
   safeHash,
@@ -17,6 +18,7 @@ import rollbackExtension, {
 import {
   bashPathHints,
   captureFileState as captureState,
+  isDestructiveCommand,
   isHcomSandbox,
   mutationPaths,
   restoreFileState as restoreState,
@@ -65,18 +67,55 @@ afterEach(() => {
   testLayouts.clear();
 });
 test("parses human-friendly rollback commands and retains JSON compatibility", () => {
-  assert.deepEqual(parseRollbackArgs("before-refactor"), { targetLabel: "before-refactor" });
+  assert.deepEqual(parseRollbackArgs("before-refactor"), { labelQuery: "before-refactor" });
+  assert.deepEqual(parseRollbackArgs("before the big refactor"), { labelQuery: "before the big refactor" });
+  assert.deepEqual(parseRollbackArgs("label:run 2"), { labelQuery: "run 2" });
   assert.deepEqual(parseRollbackArgs("before-refactor -- Try the smaller fix."), {
-    targetLabel: "before-refactor",
+    labelQuery: "before-refactor",
     continuePrompt: "Try the smaller fix.",
   });
   assert.deepEqual(parseRollbackArgs("entry:message-42"), { targetEntryId: "message-42" });
   assert.deepEqual(parseRollbackArgs("2 -- Retry carefully."), { count: 2, continuePrompt: "Retry carefully." });
+  assert.deepEqual(parseRollbackArgs("run 2"), { runCount: 2 });
+  assert.deepEqual(parseRollbackArgs("Runs 1 -- Start over"), { runCount: 1, continuePrompt: "Start over" });
   assert.deepEqual(parseRollbackArgs('{"runCount":1,"requestId":"remote"}'), { runCount: 1, requestId: "remote" });
+  assert.deepEqual(parseRollbackArgs('{"targetLabel":"before-refactor"}'), { targetLabel: "before-refactor" });
   assert.throws(() => parseRollbackArgs("before-refactor --"), /Missing continuation prompt/);
   assert.throws(() => parseRollbackArgs('{"continuePrompt":1}'), /continuePrompt must be a string/);
   assert.throws(() => parseRollbackArgs('{"count":0}'), /count must be a positive integer/);
   assert.throws(() => parseRollbackArgs('{"typo":1}'), /Unknown rollback option/);
+});
+
+test("resolves free-form checkpoint label queries", () => {
+  const base = { version: 2 as const, entryId: "e", seq: 0, createdAt: 0, mode: "normal" as const };
+  const all = [
+    { ...base, label: "before refactor" },
+    { ...base, label: "Before Migration" },
+    { ...base, label: "rollback-before-1-0" },
+  ];
+  assert.equal(resolveLabelQuery(all, "before refactor"), "before refactor");
+  assert.equal(resolveLabelQuery(all, "before migration"), "Before Migration");
+  assert.equal(resolveLabelQuery(all, "refactor"), "before refactor");
+  assert.equal(resolveLabelQuery([{ ...base, label: "run 2" }], "run 2"), "run 2");
+  assert.throws(() => resolveLabelQuery(all, "before"), /Ambiguous/);
+  assert.throws(() => resolveLabelQuery(all, "missing"), /No checkpoint matching/);
+});
+
+test("destructive command detection stays conservative", () => {
+  assert.equal(isDestructiveCommand("rm -rf build"), true);
+  assert.equal(isDestructiveCommand("cd /repo && git reset --hard HEAD~1"), true);
+  assert.equal(isDestructiveCommand("git clean -fdx"), true);
+  assert.equal(isDestructiveCommand("git checkout -- ."), true);
+  assert.equal(isDestructiveCommand("git restore src/"), true);
+  assert.equal(isDestructiveCommand("find . -name '*.log' -delete"), true);
+  assert.equal(isDestructiveCommand("echo 'DROP TABLE users' | psql"), true);
+  assert.equal(isDestructiveCommand("Remove-Item -Recurse tmp"), true);
+  assert.equal(isDestructiveCommand("dd if=img.iso of=/dev/sda"), true);
+  assert.equal(isDestructiveCommand("printf changed > demo.txt"), false);
+  assert.equal(isDestructiveCommand("git status"), false);
+  assert.equal(isDestructiveCommand("git checkout -b feature"), false);
+  assert.equal(isDestructiveCommand("npm install"), false);
+  assert.equal(isDestructiveCommand("echo firmware-update"), false);
 });
 
 function exec(command: string, args: string[], options?: { cwd?: string }) {
@@ -88,7 +127,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown> } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown> } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -150,6 +189,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
   const oldMode = process.env.HCOM_WORKER_SANDBOX;
   const oldRoot = process.env.HCOM_WORKER_SANDBOX_ROOT;
   const oldDeepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING;
+  const oldGuardDestructive = process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE;
   const pruneRoot = mkdtempSync(join(tmpdir(), "pi-rollback-harness-store-"));
   cleanup.push(pruneRoot);
   if (options.pruneSettings) writeFileSync(join(pruneRoot, "settings.json"), JSON.stringify(options.pruneSettings));
@@ -166,6 +206,8 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
   else delete process.env.HCOM_WORKER_SANDBOX;
   if (options.deepTracking) process.env.PI_ROLLBACK_DEEP_TRACKING = "1";
   else delete process.env.PI_ROLLBACK_DEEP_TRACKING;
+  if (options.guardDestructive === false) process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE = "0";
+  else delete process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE;
   delete process.env.HCOM_WORKER_SANDBOX_ROOT;
   try {
     rollbackExtension(pi, {
@@ -177,6 +219,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
     if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
     if (oldRoot === undefined) delete process.env.HCOM_WORKER_SANDBOX_ROOT; else process.env.HCOM_WORKER_SANDBOX_ROOT = oldRoot;
     if (oldDeepTracking === undefined) delete process.env.PI_ROLLBACK_DEEP_TRACKING; else process.env.PI_ROLLBACK_DEEP_TRACKING = oldDeepTracking;
+    if (oldGuardDestructive === undefined) delete process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE; else process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE = oldGuardDestructive;
     for (const name of pruneEnvNames) {
       const value = oldPruneEnv.get(name);
       if (value === undefined) delete process.env[name]; else process.env[name] = value;
@@ -565,7 +608,7 @@ test("registers mutation hooks and commands", () => {
   const run = harness(cwd);
   assert.deepEqual(Object.keys(run.handlers), ["tool_call", "session_start", "session_shutdown", "agent_start", "turn_start", "turn_end", "agent_settled"]);
   assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback-prune", "rollback", "redo"]);
-  assert.deepEqual(run.tools, ["rollback"]);
+  assert.deepEqual(run.tools, ["checkpoint", "rollback"]);
 });
 test("global settings can disable pruning without environment variables", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-settings-"));
@@ -709,4 +752,126 @@ test("restoreFileState cleans up temporary file when operation fails", () => {
 
   const files = readdirSync(base);
   assert.equal(files.some((f) => f.includes("pi-rollback")), false);
+});
+
+test("rollback accepts multi-word labels through fuzzy resolution", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-multiword-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("before the big refactor", run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("before the big refactor", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "original\n");
+});
+
+test("human run syntax rolls back to the previous agent run", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-runsyntax-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "run one\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "run two\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("run 1", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "run one\n");
+});
+
+test("destructive shell commands are auto-guarded and revertible by default", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-guard-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "precious\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -rf demo.txt" } }, run.ctx);
+  rmSync(file);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  assert.equal(run.entries.some((entry) => entry.data?.label === "auto-before-destructive-1-0"), true);
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), true);
+  await run.commands.rollback!("destructive", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "precious\n");
+});
+
+test("destructive guard can be disabled via PI_ROLLBACK_GUARD_DESTRUCTIVE", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-guard-off-"));
+  cleanup.push(cwd);
+  const run = harness(cwd, { guardDestructive: false });
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -rf demo.txt" } }, run.ctx);
+
+  assert.equal(run.entries.some((entry) => entry.data?.label?.toString().startsWith("auto-before-destructive")), false);
+});
+
+test("LLM checkpoint tool saves a labeled checkpoint and lists recent ones", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-cptool-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  const result = await run.toolDefs.checkpoint.execute("tool-1", { label: "before risky step" }, undefined, undefined, run.ctx);
+
+  assert.match(result.content[0].text, /Checkpoint saved: before risky step/);
+  assert.match(result.content[0].text, /Restore with: \/rollback/);
+  assert.equal(run.entries.some((entry) => entry.data?.label === "before risky step"), true);
+});
+
+test("destructive guard checkpoint does not revert earlier same-turn file writes", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-guard-seq-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "kept write\n");
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -rf other.txt" } }, run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("destructive", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "kept write\n");
+});
+
+test("checkpoints listing shows friendly restore hints", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-listing-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("before refactor", run.ctx);
+  await run.commands.checkpoints!("", run.ctx);
+
+  const text = run.notifications.join("\n");
+  assert.match(text, /Rollback checkpoints \(oldest → newest\)/);
+  assert.match(text, /run 1 turn 0 start · auto/);
+  assert.match(text, /before refactor/);
+  assert.match(text, /\(\/rollback \d+( · \/rollback run \d+)?\)/);
+  assert.match(text, /Restore with: \/rollback <label> · \/rollback <n> · \/rollback run <n> · \/redo/);
 });

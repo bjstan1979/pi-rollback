@@ -10,6 +10,7 @@ import {
   canonicalMutationPath,
   captureFileState,
   type FileState,
+  isDestructiveCommand,
   isHcomSandbox,
   isWithin,
   mutationPaths,
@@ -46,7 +47,7 @@ const VERSION = 2;
 type RootState = { root: string; tree: string; storeBase: string };
 type Mutation = FileMutation | RootMutation;
 
-interface Checkpoint {
+export interface Checkpoint {
   version: typeof VERSION;
   entryId: string;
   seq: number;
@@ -81,6 +82,8 @@ interface RootMutation {
 
 export interface RollbackArgs {
   targetLabel?: string;
+  /** Free-form label query resolved against active checkpoints before rollback. */
+  labelQuery?: string;
   targetEntryId?: string;
   count?: number;
   runCount?: number;
@@ -310,7 +313,7 @@ function notify(ctx: CheckpointContext, message: string): void {
   if (ctx.hasUI) ctx.ui.notify(message, "warning");
 }
 
-async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: string, sandboxed: boolean): Promise<Checkpoint | undefined> {
+async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: string, sandboxed: boolean, labeledEntries: Set<string> = new Set()): Promise<Checkpoint | undefined> {
   const entryId = ctx.sessionManager.getLeafId();
   if (!entryId) return undefined;
   const checkpoint: Checkpoint = {
@@ -326,22 +329,90 @@ async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: s
     const tree = await capture(pi, ctx.cwd, storeBase);
     checkpoint.sandbox = { root: ctx.cwd, tree, storeBase };
   }
-  pi.setLabel(entryId, label);
+  // Keep the first label a session entry receives (e.g. the run-boundary label
+  // from turn_start) instead of overwriting it with later checkpoints that
+  // share the same leaf.
+  if (!labeledEntries.has(entryId)) {
+    pi.setLabel(entryId, label);
+    labeledEntries.add(entryId);
+  }
   pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
   return checkpoint;
 }
 
-function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId" | "targetLabel"> {
-  if (/^\d+$/.test(value)) return { count: Number(value) };
-  if (value.startsWith("entry:")) {
-    const targetEntryId = value.slice("entry:".length).trim();
+function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId" | "targetLabel" | "runCount" | "labelQuery"> {
+  const input = value.trim();
+  if (!input) return { count: 1 };
+  if (/^\d+$/.test(input)) return { count: Number(input) };
+  if (input.startsWith("entry:")) {
+    const targetEntryId = input.slice("entry:".length).trim();
     if (!targetEntryId) throw new Error("Missing entry id after entry:");
     return { targetEntryId };
   }
-  const targetLabel = value.startsWith("label:") ? value.slice("label:".length).trim() : value;
+  const runMatch = /^runs?\s+(\d+)$/i.exec(input);
+  if (runMatch) return { runCount: Number(runMatch[1]) };
+  // Free-form label, spaces allowed. Use the explicit `label:` prefix only to
+  // disambiguate a label that itself looks like another target form.
+  const targetLabel = input.startsWith("label:") ? input.slice("label:".length).trim() : input;
   if (!targetLabel) throw new Error("Missing rollback target");
-  if (/\s/.test(targetLabel)) throw new Error("Checkpoint labels cannot contain spaces; use the label shown by /checkpoints");
-  return { targetLabel };
+  return { labelQuery: targetLabel };
+}
+
+/** Resolve a free-form label query to an exact active checkpoint label. */
+export function resolveLabelQuery(all: Checkpoint[], query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) throw new Error("Missing rollback target");
+  const exact = all.findLast((checkpoint) => checkpoint.label === trimmed);
+  if (exact) return exact.label;
+  const lower = trimmed.toLowerCase();
+  const caseInsensitive = all.findLast((checkpoint) => checkpoint.label.toLowerCase() === lower);
+  if (caseInsensitive) return caseInsensitive.label;
+  const matches = [...new Set(all.filter((checkpoint) => checkpoint.label.toLowerCase().includes(lower)).map((checkpoint) => checkpoint.label))];
+  if (matches.length === 1) return matches[0]!;
+  if (matches.length > 1) throw new Error(`Ambiguous checkpoint "${trimmed}" — candidates: ${matches.slice(-5).join(", ")}`);
+  throw new Error(`No checkpoint matching "${trimmed}". Run /checkpoints to list available checkpoints.`);
+}
+
+export function relativeTime(from: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.round((now - from) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function compactTimestamp(now = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function describeCheckpoint(checkpoint: Checkpoint): string {
+  const turn = /^rollback-(before|after)-(\d+)-(\d+)$/.exec(checkpoint.label);
+  if (turn) return `run ${turn[2]} turn ${turn[3]} ${turn[1] === "before" ? "start" : "end"} · auto`;
+  if (checkpoint.label.startsWith("auto-before-destructive")) return "before destructive command · auto";
+  return checkpoint.label;
+}
+
+function formatCheckpointList(ctx: CheckpointContext, now = Date.now()): string {
+  const all = checkpoints(ctx);
+  if (!all.length) return "No rollback checkpoints yet — save one with /checkpoint <label>.";
+  const visible = all.slice(-20);
+  const hidden = all.length - visible.length;
+  const lines = visible.map((checkpoint, index) => {
+    const back = all.length - 1 - (hidden + index);
+    const hints: string[] = [];
+    if (back >= 1) hints.push(`/rollback ${back}`);
+    const runStart = /^rollback-before-(\d+)-0$/.exec(checkpoint.label);
+    if (runStart) hints.push(`/rollback run ${runStart[1]}`);
+    const hint = hints.length ? `   (${hints.join(" · ")})` : "";
+    return `${String(hidden + index + 1).padStart(2)}. ${describeCheckpoint(checkpoint)} · ${relativeTime(checkpoint.createdAt, now)}` + hint;
+  });
+  const parts = ["Rollback checkpoints (oldest → newest):", ...lines.map((line) => `  ${line}`)];
+  if (hidden > 0) parts.push(`  … ${hidden} older hidden`);
+  parts.push("Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo");
+  return parts.join("\n");
 }
 function jsonRollbackArgs(value: unknown): RollbackArgs {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Rollback JSON must be an object");
@@ -461,6 +532,7 @@ export interface RollbackExtensionOptions {
 export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExtensionOptions = {}): void {
   const sandboxed = isHcomSandbox();
   const deepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING === "1";
+  const guardDestructive = process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE !== "0" && process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE !== "false";
   const normalLayoutRoot = options.normalLayoutRoot ?? SNAPSHOT_ROOT;
   const pruneSettings = readPruneSettings(options.pruneSettingsPath ?? join(getAgentDir(), "settings.json"));
   const pruneConfig: PruneConfig = pruneSettings.warning
@@ -470,6 +542,9 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   let lastPruneAt: number | undefined;
   const leases = new Map<string, LeaseHandle>();
   let agentRun = 0;
+  let currentTurnIndex = 0;
+  let guardedTurn: string | undefined;
+  const labeledEntries = new Set<string>();
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
 
@@ -606,9 +681,28 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       for (const path of mutationPaths(event.toolName, event.input, ctx.cwd, false)) {
         if (!pendingFiles.has(path)) pendingFiles.set(path, { path, before: captureFileState(path, options.blobRoot) });
       }
-      if ((event.toolName !== "bash" && event.toolName !== "powershell") || !deepTracking) return;
+      const isShell = event.toolName === "bash" || event.toolName === "powershell";
       const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : {};
-      const command = typeof input.command === "string" ? input.command : "";
+      const command = isShell && typeof input.command === "string" ? input.command : "";
+      // Destructive-command guard: before a plausibly irreversible shell command
+      // runs (once per turn), flush the journal, drop an auto checkpoint, and
+      // capture a workspace tree baseline so the damage is revertible even with
+      // deep tracking disabled. bash changes are otherwise unjournaled by default.
+      if (isShell && guardDestructive && command && isDestructiveCommand(command) && guardedTurn !== `${agentRun}:${currentTurnIndex}`) {
+        guardedTurn = `${agentRun}:${currentTurnIndex}`;
+        try {
+          await flushPending(ctx);
+          await saveCheckpoint(pi, ctx, `auto-before-destructive-${agentRun}-${currentTurnIndex}`, sandboxed, labeledEntries);
+          const root = resolve(ctx.cwd);
+          if (!pendingRoots.has(root)) {
+            const storeBase = sessionStore(ctx.sessionManager.getSessionId(), normalLayoutRoot);
+            pendingRoots.set(root, { root, before: await capture(pi, root, storeBase), storeBase });
+          }
+        } catch (guardError) {
+          notify(ctx, `Rollback destructive guard skipped: ${String(guardError)}`);
+        }
+      }
+      if (!isShell || !deepTracking) return;
       const roots = new Set<string>();
       addRoot(roots, ctx.cwd);
       for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)));
@@ -644,6 +738,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.on("turn_start", async (event, ctx) => {
+    if (typeof event.turnIndex === "number") currentTurnIndex = event.turnIndex;
     try {
       protectCurrent(ctx);
       await flushPending(ctx);
@@ -655,7 +750,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       // let commit-hook edits be silently destroyed by rollback — observed on
       // 2026-09-30 with three 0.99.1 adaptation files.)
       await captureExternalChanges(ctx);
-      await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed);
+      await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed, labeledEntries);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
     }
@@ -665,7 +760,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     try {
       protectCurrent(ctx);
       await flushPending(ctx);
-      await saveCheckpoint(pi, ctx, `rollback-after-${agentRun}-${event.turnIndex}`, sandboxed);
+      await saveCheckpoint(pi, ctx, `rollback-after-${agentRun}-${event.turnIndex}`, sandboxed, labeledEntries);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
     }
@@ -859,24 +954,22 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("checkpoint", {
-    description: "Save a rollback checkpoint",
+    description: "Save a rollback checkpoint (label is free-form text)",
     handler: async (args, ctx) => {
       protectCurrent(ctx);
       await ctx.waitForIdle();
       await flushPending(ctx);
       await captureExternalChanges(ctx);
-      const label = args.trim() || `checkpoint-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-      const checkpoint = await saveCheckpoint(pi, ctx, label, sandboxed);
+      const label = args.trim() || `checkpoint-${compactTimestamp()}`;
+      const checkpoint = await saveCheckpoint(pi, ctx, label, sandboxed, labeledEntries);
       if (ctx.hasUI) ctx.ui.notify(checkpoint ? `Checkpoint saved: ${label}` : "No session entry to checkpoint", checkpoint ? "info" : "warning");
     },
   });
 
   pi.registerCommand("checkpoints", {
-    description: "List active rollback checkpoints",
+    description: "List rollback checkpoints with restore hints",
     handler: async (_args, ctx) => {
-      const all = checkpoints(ctx).slice(-20);
-      const text = all.length ? all.map((item, index) => `${index + 1}. ${item.label} · seq ${item.seq} · ${item.mode}`).join("\n") : "No rollback checkpoints.";
-      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      if (ctx.hasUI) ctx.ui.notify(formatCheckpointList(ctx), "info");
     },
   });
   pi.registerCommand("rollback-prune", {
@@ -895,10 +988,19 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("rollback", {
-    description: "Restore files and conversation: /rollback <label>|entry:<id>|<count> [-- <continue prompt>]",
+    description: "Restore files and conversation: /rollback [label | <n> | run <n>] [-- <continue prompt>]",
     handler: async (raw, ctx) => {
       protectCurrent(ctx);
-      await runRollback(parseRollbackArgs(raw), ctx);
+      try {
+        const args = parseRollbackArgs(raw);
+        if (args.labelQuery !== undefined) {
+          args.targetLabel = resolveLabelQuery(checkpoints(ctx), args.labelQuery);
+          delete args.labelQuery;
+        }
+        await runRollback(args, ctx);
+      } catch (error) {
+        if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     },
   });
 
@@ -911,14 +1013,38 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerTool({
+    name: "checkpoint",
+    label: "Checkpoint",
+    description: "Save a rollback checkpoint of the conversation and journaled workspace files. Cheap and safe; call it before risky or hard-to-reverse steps so the rollback tool can restore this point later.",
+    promptSnippet: "Save a named rollback checkpoint before risky or hard-to-reverse steps",
+    promptGuidelines: [
+      "Call checkpoint before risky or hard-to-reverse work — bulk edits across many files, destructive shell commands, dependency or schema migrations, large refactors — and when you reach a stable verified state worth keeping.",
+      "Labels are free-form and may contain spaces (for example 'before db migration'); keep them short and descriptive. Roll back to a checkpoint later with the rollback tool's targetLabel, or tell the user to run /rollback <label>.",
+    ],
+    parameters: Type.Object({
+      label: Type.Optional(Type.String({ description: "Short free-form label, e.g. 'before db migration'. Defaults to a timestamp." })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      protectCurrent(ctx);
+      await flushPending(ctx);
+      await captureExternalChanges(ctx);
+      const label = (params.label ?? "").trim() || `checkpoint-${compactTimestamp()}`;
+      const checkpoint = await saveCheckpoint(pi, ctx, label, sandboxed, labeledEntries);
+      if (!checkpoint) return { content: [{ type: "text", text: "No session entry to checkpoint." }], details: { saved: false } };
+      return { content: [{ type: "text", text: `Checkpoint saved: ${label}\n\n${formatCheckpointList(ctx)}` }], details: { saved: true, label } };
+    },
+  });
+
+  pi.registerTool({
     name: "rollback",
     label: "Rollback",
     description: "Queue rollback to the start of this agent run, or restore an explicit checkpoint by label or entry ID.",
     promptSnippet: "Roll back conversation and journaled workspace files to an earlier agent run or checkpoint",
     promptGuidelines: [
+      "Save cheap checkpoints with the checkpoint tool before risky or hard-to-reverse work. Automatic checkpoints also bracket every model turn, and destructive shell commands are auto-guarded with a checkpoint plus a workspace snapshot you can roll back to (label prefix auto-before-destructive).",
       "Use rollback when the user asks to undo or roll back your latest agent run; count is run-relative (default 1), while targetLabel/targetEntryId restore explicit checkpoints. The rollback is queued after the current turn, so stop making changes after calling it.",
       "You may proactively roll back without waiting for the user when the same failure repeats, attempted fixes begin spreading across files or overwriting earlier work, or evidence shows the current implementation direction is wrong. Prefer rollback over stacking speculative repair patches in those cases.",
-      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label>|entry:<id>|<count> [-- <continue prompt>], and /redo.",
+      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label> | <n> | run <n> [-- <continue prompt>], and /redo.",
     ],
     parameters: Type.Object({
       targetLabel: Type.Optional(Type.String()),
