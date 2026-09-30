@@ -23,7 +23,7 @@ Checkpoints are saved automatically before and after every model turn, so undo t
 /rollback before refactor -- Try the smaller fix.
 /rollback entry:<session-entry-id>     # exact power-user form
 /checkpoint before the big refactor    # bare /checkpoint asks for a label via input dialog
-/checkpoints                           # grouped restore points (newest first, turn noise collapsed)
+/checkpoints                           # interactive picker (select + confirm); Esc falls back to the text list
 /checkpoints all                       # raw turn-level list
 /checkpoints 60                        # last 60 raw checkpoints
 /checkpoints refactor                  # filter restore points by label or message text
@@ -31,7 +31,7 @@ Checkpoints are saved automatically before and after every model turn, so undo t
 /rollback-prune
 ```
 
-The picker and `/checkpoints` show each restore point as the message you sent at that moment, plus named checkpoints and `! before destructive command` guards; turn-level auto checkpoints are collapsed because they carry no human-readable meaning. Cancelling the picker (`Esc`) leaves everything untouched.
+Both bare `/rollback` and bare `/checkpoints` open the picker in TUI/RPC modes; `/checkpoints` asks for a one-key confirm before restoring, and Esc at any point falls back to (or just shows) the text listing. The picker and listing show each restore point as the message you sent at that moment, plus named checkpoints and `! before destructive command` guards; turn-level auto checkpoints are collapsed because they carry no human-readable meaning.
 
 Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number or `run <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`). The numeric target counts checkpoints, not whole agent runs.
 

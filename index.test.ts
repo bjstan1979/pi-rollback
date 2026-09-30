@@ -128,7 +128,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; inputValue?: string | undefined; noUI?: boolean } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; confirmValue?: boolean; inputValue?: string | undefined; noUI?: boolean } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -186,6 +186,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
         return options.selectChoice !== undefined && choices.includes(options.selectChoice) ? options.selectChoice : undefined;
       },
       async input(_title: string, _placeholder?: string) { return options.inputValue; },
+      async confirm(_title: string, _message: string) { return options.confirmValue ?? true; },
     },
     sessionManager: {
       getLeafId: () => leaf,
@@ -1005,4 +1006,49 @@ test("checkpoints listing can expand and filter beyond the default window", asyn
   run.notifications.length = 0;
   await run.commands.checkpoints!("no-such-label", run.ctx);
   assert.match(run.notifications.at(-1)!, /No restore points matching/);
+});
+
+test("checkpoints command offers the picker with confirm, Esc and decline fall back to listing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-cppicker-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+
+  const base = () => {
+    const run = harness(cwd, { selectResolver: (choices) => choices.find((choice) => choice.includes("edit the file")) });
+    return run;
+  };
+  const seed = async (run: ReturnType<typeof base>) => {
+    writeFileSync(file, "original\n");
+    run.pushUser("edit the file");
+    await run.handlers.agent_start!({}, run.ctx);
+    await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+    await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+    writeFileSync(file, "changed\n");
+    await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  };
+
+  // Esc in the picker: no rollback, text listing shown
+  const esc = harness(cwd);
+  await seed(esc);
+  esc.notifications.length = 0;
+  await esc.commands.checkpoints!("", esc.ctx);
+  assert.equal(readFileSync(file, "utf8"), "changed\n");
+  assert.match(esc.notifications.join("\n"), /Restore points \(newest first/);
+
+  // Picker selection + confirmed → rollback executes
+  const pick = base();
+  await seed(pick);
+  await pick.commands.checkpoints!("", pick.ctx);
+  assert.equal(readFileSync(file, "utf8"), "original\n");
+  assert.equal((pick.emitted.at(-1)!.data as { targetLabel?: string }).targetLabel, "rollback-before-1-0");
+
+  // Picker selection + declined confirm → cancelled notify + listing, no rollback
+  const decline = harness(cwd, { selectResolver: (choices) => choices.find((choice) => choice.includes("edit the file")), confirmValue: false });
+  await seed(decline);
+  decline.notifications.length = 0;
+  await decline.commands.checkpoints!("", decline.ctx);
+  assert.equal(readFileSync(file, "utf8"), "changed\n");
+  assert.match(decline.notifications.join("\n"), /Rollback cancelled/);
+  assert.match(decline.notifications.join("\n"), /Restore points \(newest first/);
 });

@@ -1071,11 +1071,29 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("checkpoints", {
-    description: "List restore points: /checkpoints [all | <n> | <filter text>]",
+    description: "Browse restore points: bare opens a picker (Enter selects, Esc lists); all | <n> | <text> = text views",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
       const input = args.trim();
       try {
+        if (!input && typeof ctx.ui.select === "function") {
+          const menu = buildRestoreMenu(ctx);
+          if (menu.length) {
+            const choice = await ctx.ui.select("Checkpoints — select to roll back, Esc to list", menu.map((option) => option.display));
+            if (choice !== undefined) {
+              const option = menu.find((item) => item.display === choice);
+              if (option) {
+                const confirmed = typeof ctx.ui.confirm === "function" ? await ctx.ui.confirm("Roll back to checkpoint", choice) : true;
+                if (confirmed) {
+                  await runRollback({ ...option.args }, ctx);
+                  return;
+                }
+                ctx.ui.notify("Rollback cancelled", "info");
+              }
+            }
+            // Esc or declined confirm: fall through to the text listing.
+          }
+        }
         if (/^all$/i.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: 0 }), "info");
         else if (/^\d+$/.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: Math.max(1, Number(input)) }), "info");
         else ctx.ui.notify(formatRestoreMenu(ctx, input || undefined), "info");
