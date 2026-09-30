@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import rollbackExtension, {
+  buildRestoreMenu,
   capture as captureSnapshot,
   parseRollbackArgs,
   resolveLabelQuery,
@@ -127,13 +128,13 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown> } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; inputValue?: string | undefined; noUI?: boolean } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
   const tools: string[] = [];
   const toolDefs: Record<string, any> = {};
-  const entries: any[] = [{ id: "message-0", type: "message", parentId: null }];
+  const entries: any[] = [{ id: "message-0", type: "message", parentId: null, message: { role: "user", content: [{ type: "text", text: "first user message" }] } }];
   let leaf = "message-0";
   const branch = () => {
     const active: any[] = [];
@@ -147,6 +148,13 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
     return active;
   };
   let next = 0;
+  let msgCount = 0;
+  const pushUser = (text: string) => {
+    const entry = { id: `user-msg-${++msgCount}`, type: "message", parentId: leaf, message: { role: "user", content: [{ type: "text", text }] } };
+    entries.push(entry);
+    leaf = entry.id;
+    return entry;
+  };
   let navigatedTo: string | undefined;
   const notifications: string[] = [];
   const sentMessages: Array<{ content: string; options: unknown }> = [];
@@ -170,8 +178,15 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
   } as unknown as ExtensionAPI;
   const ctx = {
     cwd,
-    hasUI: true,
-    ui: { notify(message: string) { notifications.push(message); } },
+    hasUI: !options.noUI,
+    ui: {
+      notify(message: string) { notifications.push(message); },
+      async select(_title: string, choices: string[]) {
+        if (options.selectResolver) return options.selectResolver(choices);
+        return options.selectChoice !== undefined && choices.includes(options.selectChoice) ? options.selectChoice : undefined;
+      },
+      async input(_title: string, _placeholder?: string) { return options.inputValue; },
+    },
     sessionManager: {
       getLeafId: () => leaf,
       getSessionId: () => "session-test",
@@ -225,7 +240,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
       if (value === undefined) delete process.env[name]; else process.env[name] = value;
     }
   }
-  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, pruneRoot, navigatedTo: () => navigatedTo, activeEntries: branch };
+  return { handlers, commands, tools, toolDefs, entries, ctx, notifications, sentMessages, emitted, pruneRoot, pushUser, navigatedTo: () => navigatedTo, activeEntries: branch };
 }
 
 test("root snapshot restores files without touching the project git index", async () => {
@@ -836,7 +851,7 @@ test("LLM checkpoint tool saves a labeled checkpoint and lists recent ones", asy
   const result = await run.toolDefs.checkpoint.execute("tool-1", { label: "before risky step" }, undefined, undefined, run.ctx);
 
   assert.match(result.content[0].text, /Checkpoint saved: before risky step/);
-  assert.match(result.content[0].text, /Restore with: \/rollback/);
+  assert.match(result.content[0].text, /Instant: \/rollback opens an interactive picker/);
   assert.equal(run.entries.some((entry) => entry.data?.label === "before risky step"), true);
 });
 
@@ -858,7 +873,7 @@ test("destructive guard checkpoint does not revert earlier same-turn file writes
   assert.equal(readFileSync(file, "utf8"), "kept write\n");
 });
 
-test("checkpoints listing shows friendly restore hints", async () => {
+test("checkpoints listing anchors on user messages and hides turn noise", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-listing-"));
   cleanup.push(cwd);
   const run = harness(cwd);
@@ -869,11 +884,80 @@ test("checkpoints listing shows friendly restore hints", async () => {
   await run.commands.checkpoints!("", run.ctx);
 
   const text = run.notifications.join("\n");
-  assert.match(text, /Rollback checkpoints \(oldest → newest\)/);
-  assert.match(text, /run 1 turn 0 start · auto/);
+  assert.match(text, /Restore points \(newest first — one per message you sent\)/);
   assert.match(text, /before refactor/);
-  assert.match(text, /\(\/rollback \d+( · \/rollback run \d+)?\)/);
-  assert.match(text, /Restore with: \/rollback <label> · \/rollback <n> · \/rollback run <n> · \/redo/);
+  assert.match(text, /first user message/);
+  assert.doesNotMatch(text, /run 1 turn 0 start/);
+  assert.match(text, /Instant: \/rollback opens an interactive picker/);
+});
+
+test("restore menu marks guards and current run, and orders newest first", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-menu-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+
+  run.pushUser("fix the bug");
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  run.pushUser("now optimize it");
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -rf temp" } }, run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  const menu = buildRestoreMenu(run.ctx);
+  assert.equal(menu.length, 3);
+  assert.match(menu[0]!.display, /! before destructive command/);
+  assert.match(menu[1]!.display, /now optimize it/);
+  assert.match(menu[1]!.display, /current run/);
+  assert.equal(menu[1]!.command, "/rollback run 1");
+  assert.match(menu[2]!.display, /fix the bug/);
+  assert.equal(menu[2]!.command, "/rollback run 2");
+});
+
+test("bare rollback opens an interactive picker and restores the chosen point", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-picker-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+
+  const cancelled = harness(cwd);
+  await cancelled.handlers.agent_start!({}, cancelled.ctx);
+  await cancelled.handlers.turn_start!({ turnIndex: 0 }, cancelled.ctx);
+  await cancelled.commands.rollback!("", cancelled.ctx);
+  assert.match(cancelled.notifications.join("\n"), /Rollback cancelled/);
+  assert.equal(cancelled.navigatedTo(), undefined);
+
+  const run = harness(cwd, { selectResolver: (choices) => choices.find((choice) => choice.includes("edit the file")) });
+  run.pushUser("edit the file");
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "original\n");
+  assert.equal((run.emitted.at(-1)!.data as { targetLabel?: string }).targetLabel, "rollback-before-1-0");
+});
+
+test("bare rollback keeps count-1 behavior without dialog UI", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-nodialog-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd, { noUI: true });
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "original\n");
 });
 
 test("checkpoints listing can expand and filter beyond the default window", async () => {
@@ -895,7 +979,9 @@ test("checkpoints listing can expand and filter beyond the default window", asyn
   run.notifications.length = 0;
   await run.commands.checkpoints!("", run.ctx);
   const defaultView = run.notifications.at(-1)!;
-  assert.match(defaultView, /older hidden/);
+  assert.match(defaultView, /Restore points \(newest first/);
+  assert.match(defaultView, /before the big refactor/);
+  assert.match(defaultView, /first user message/);
 
   run.notifications.length = 0;
   await run.commands.checkpoints!("all", run.ctx);
@@ -911,11 +997,12 @@ test("checkpoints listing can expand and filter beyond the default window", asyn
   run.notifications.length = 0;
   await run.commands.checkpoints!("big refactor", run.ctx);
   const filteredView = run.notifications.at(-1)!;
-  assert.match(filteredView, /matching "big refactor"/);
+  assert.match(filteredView, /before the big refactor/);
+  assert.doesNotMatch(filteredView, /first user message/);
   assert.match(filteredView, /before the big refactor/);
   assert.doesNotMatch(filteredView, /run 1 turn 0 start/);
 
   run.notifications.length = 0;
   await run.commands.checkpoints!("no-such-label", run.ctx);
-  assert.match(run.notifications.at(-1)!, /No rollback checkpoints matching/);
+  assert.match(run.notifications.at(-1)!, /No restore points matching/);
 });

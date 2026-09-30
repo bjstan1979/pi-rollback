@@ -126,6 +126,7 @@ interface SessionEntry {
   type: string;
   customType?: string;
   data?: unknown;
+  message?: { role?: string; content?: unknown };
 }
 
 type CheckpointContext = Pick<ExtensionCommandContext, "sessionManager" | "cwd" | "hasUI" | "ui">;
@@ -268,29 +269,31 @@ export async function restore(
   return withStoreLock(storeBase, () => restoreInternal(pi, cwd, target, storeBase));
 }
 
-function activeEntries(ctx: CheckpointContext): SessionEntry[] {
+type BranchContext = { sessionManager: Pick<ExtensionCommandContext["sessionManager"], "getBranch"> };
+
+function activeEntries(ctx: BranchContext): SessionEntry[] {
   return ctx.sessionManager.getBranch() as SessionEntry[];
 }
 
-function dataEntries<T>(ctx: CheckpointContext, customType: string): T[] {
+function dataEntries<T>(ctx: BranchContext, customType: string): T[] {
   return activeEntries(ctx)
     .filter((entry) => entry.type === "custom" && entry.customType === customType)
     .map((entry) => entry.data as T);
 }
 
-function mutations(ctx: CheckpointContext): Mutation[] {
+function mutations(ctx: BranchContext): Mutation[] {
   return dataEntries<Mutation>(ctx, MUTATION_TYPE)
     .filter((item) => item?.version === VERSION && (item.kind === "file" || item.kind === "root"))
     .sort((a, b) => a.seq - b.seq);
 }
 
-function checkpoints(ctx: CheckpointContext): Checkpoint[] {
+function checkpoints(ctx: BranchContext): Checkpoint[] {
   return dataEntries<Checkpoint>(ctx, CHECKPOINT_TYPE)
     .filter((item) => item?.version === VERSION)
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
-function activeRedo(ctx: CheckpointContext): ActiveRedo | undefined {
+function activeRedo(ctx: BranchContext): ActiveRedo | undefined {
   const entry = activeEntries(ctx).findLast((item) =>
     item.type === "custom"
     && item.customType === REDO_TYPE
@@ -299,7 +302,7 @@ function activeRedo(ctx: CheckpointContext): ActiveRedo | undefined {
   return entry ? { entryId: entry.id, data: entry.data as RedoRecord } : undefined;
 }
 
-function currentSeq(ctx: CheckpointContext): number {
+function currentSeq(ctx: BranchContext): number {
   return mutations(ctx).reduce((max, item) => Math.max(max, item.seq), 0);
 }
 
@@ -393,6 +396,90 @@ function describeCheckpoint(checkpoint: Checkpoint): string {
   if (turn) return `run ${turn[2]} turn ${turn[3]} ${turn[1] === "before" ? "start" : "end"} · auto`;
   if (checkpoint.label.startsWith("auto-before-destructive")) return "before destructive command · auto";
   return checkpoint.label;
+}
+
+const AUTO_TURN_LABEL = /^rollback-(before|after)-\d+-\d+$/;
+const RUN_START_LABEL = /^rollback-before-(\d+)-0$/;
+
+function firstUserText(entry: SessionEntry): string {
+  const message = entry.message;
+  if (!message || message.role !== "user") return "";
+  const content = Array.isArray(message.content) ? message.content : [];
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+      const text = String((block as { text?: unknown }).text ?? "").trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function snippet(text: string, max = 48): string {
+  const collapsed = text.replaceAll(/\s+/g, " ").trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max)}…` : collapsed;
+}
+
+export interface RestoreOption {
+  /** Line shown in the picker/list. */
+  display: string;
+  /** Exact args that restore this point. */
+  args: Pick<RollbackArgs, "targetLabel">;
+  /** Human-typable command hint. */
+  command: string;
+  /** True when the option anchors on a user message. */
+  message?: string;
+}
+
+/**
+ * Build the human-facing restore menu: one entry per user message (run start),
+ * plus named checkpoints and destructive guards. Turn-level auto checkpoints
+ * are deliberately collapsed — they carry no information a human can act on.
+ */
+export function buildRestoreMenu(ctx: BranchContext): RestoreOption[] {
+  const all = checkpoints(ctx);
+  const snippets = new Map<string, string>();
+  for (const entry of activeEntries(ctx)) {
+    const text = firstUserText(entry);
+    if (text) snippets.set(entry.id, snippet(text));
+  }
+  let latestRun = 0;
+  for (const checkpoint of all) {
+    const match = RUN_START_LABEL.exec(checkpoint.label);
+    if (match) latestRun = Math.max(latestRun, Number(match[1]));
+  }
+  const options: RestoreOption[] = [];
+  for (const checkpoint of [...all].reverse()) {
+    const runStart = RUN_START_LABEL.exec(checkpoint.label);
+    if (runStart) {
+      const runNo = Number(runStart[1]);
+      const message = snippets.get(checkpoint.entryId);
+      const ago = relativeTime(checkpoint.createdAt);
+      const current = runNo === latestRun ? " · current run" : "";
+      const display = message ? `“${message}” · ${ago}${current}` : `start of run ${runNo} · ${ago}${current}`;
+      options.push({ display, args: { targetLabel: checkpoint.label }, command: `/rollback run ${latestRun - runNo + 1}`, message });
+      continue;
+    }
+    if (checkpoint.label.startsWith("auto-before-destructive")) {
+      options.push({ display: `! before destructive command · ${relativeTime(checkpoint.createdAt)}`, args: { targetLabel: checkpoint.label }, command: `/rollback ${checkpoint.label}` });
+      continue;
+    }
+    if (AUTO_TURN_LABEL.test(checkpoint.label)) continue;
+    options.push({ display: `${checkpoint.label} · ${relativeTime(checkpoint.createdAt)}`, args: { targetLabel: checkpoint.label }, command: `/rollback ${checkpoint.label}` });
+  }
+  return options.slice(0, 20);
+}
+
+function formatRestoreMenu(ctx: BranchContext, filter?: string): string {
+  let options = buildRestoreMenu(ctx);
+  if (filter) {
+    const needle = filter.toLowerCase();
+    options = options.filter((option) => option.display.toLowerCase().includes(needle));
+    if (!options.length) return `No restore points matching "${filter}".`;
+  }
+  const lines = options.map((option, index) => `${String(index + 1).padStart(2)}. ${option.display}   (${option.command})`);
+  const parts = ["Restore points (newest first — one per message you sent):", ...lines.map((line) => `  ${line}`)];
+  parts.push("Instant: /rollback opens an interactive picker · /checkpoints all lists raw turn-level checkpoints");
+  return parts.join("\n");
 }
 
 function formatCheckpointList(ctx: CheckpointContext, now = Date.now(), view: { limit?: number; filter?: string } = {}): string {
@@ -968,22 +1055,30 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       await ctx.waitForIdle();
       await flushPending(ctx);
       await captureExternalChanges(ctx);
-      const label = args.trim() || `checkpoint-${compactTimestamp()}`;
-      const checkpoint = await saveCheckpoint(pi, ctx, label, sandboxed, labeledEntries);
-      if (ctx.hasUI) ctx.ui.notify(checkpoint ? `Checkpoint saved: ${label}` : "No session entry to checkpoint", checkpoint ? "info" : "warning");
+      let label = args.trim();
+      if (!label && ctx.hasUI && typeof ctx.ui.input === "function") {
+        const typed = await ctx.ui.input("Checkpoint label (optional)", "free-form, e.g. before the big refactor");
+        if (typed === undefined) {
+          ctx.ui.notify("Checkpoint cancelled", "info");
+          return;
+        }
+        label = typed.trim();
+      }
+      const finalLabel = label || `checkpoint-${compactTimestamp()}`;
+      const checkpoint = await saveCheckpoint(pi, ctx, finalLabel, sandboxed, labeledEntries);
+      if (ctx.hasUI) ctx.ui.notify(checkpoint ? `Checkpoint saved: ${finalLabel}` : "No session entry to checkpoint", checkpoint ? "info" : "warning");
     },
   });
 
   pi.registerCommand("checkpoints", {
-    description: "List rollback checkpoints: /checkpoints [n | all | <filter text>]",
+    description: "List restore points: /checkpoints [all | <n> | <filter text>]",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
       const input = args.trim();
       try {
-        if (!input) ctx.ui.notify(formatCheckpointList(ctx), "info");
-        else if (/^all$/i.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: 0 }), "info");
+        if (/^all$/i.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: 0 }), "info");
         else if (/^\d+$/.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: Math.max(1, Number(input)) }), "info");
-        else ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { filter: input }), "info");
+        else ctx.ui.notify(formatRestoreMenu(ctx, input || undefined), "info");
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -1005,10 +1100,25 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("rollback", {
-    description: "Restore files and conversation: /rollback [label | <n> | run <n>] [-- <continue prompt>]",
+    description: "Restore files and conversation — bare /rollback opens a picker; direct: /rollback <label> | <n> | run <n> [-- <continue prompt>]",
     handler: async (raw, ctx) => {
       protectCurrent(ctx);
       try {
+        if (!raw.trim() && ctx.hasUI && typeof ctx.ui.select === "function") {
+          const menu = buildRestoreMenu(ctx);
+          if (menu.length) {
+            const choice = await ctx.ui.select("Roll back to…", menu.map((option) => option.display));
+            if (choice === undefined) {
+              ctx.ui.notify("Rollback cancelled", "info");
+              return;
+            }
+            const option = menu.find((item) => item.display === choice);
+            if (option) {
+              await runRollback({ ...option.args }, ctx);
+              return;
+            }
+          }
+        }
         const args = parseRollbackArgs(raw);
         if (args.labelQuery !== undefined) {
           args.targetLabel = resolveLabelQuery(checkpoints(ctx), args.labelQuery);
@@ -1048,7 +1158,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       const label = (params.label ?? "").trim() || `checkpoint-${compactTimestamp()}`;
       const checkpoint = await saveCheckpoint(pi, ctx, label, sandboxed, labeledEntries);
       if (!checkpoint) return { content: [{ type: "text", text: "No session entry to checkpoint." }], details: { saved: false } };
-      return { content: [{ type: "text", text: `Checkpoint saved: ${label}\n\n${formatCheckpointList(ctx)}` }], details: { saved: true, label } };
+      return { content: [{ type: "text", text: `Checkpoint saved: ${label}\n\n${formatRestoreMenu(ctx)}` }], details: { saved: true, label } };
     },
   });
 
@@ -1061,7 +1171,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       "Save cheap checkpoints with the checkpoint tool before risky or hard-to-reverse work. Automatic checkpoints also bracket every model turn, and destructive shell commands are auto-guarded with a checkpoint plus a workspace snapshot you can roll back to (label prefix auto-before-destructive).",
       "Use rollback when the user asks to undo or roll back your latest agent run; count is run-relative (default 1), while targetLabel/targetEntryId restore explicit checkpoints. The rollback is queued after the current turn, so stop making changes after calling it.",
       "You may proactively roll back without waiting for the user when the same failure repeats, attempted fixes begin spreading across files or overwriting earlier work, or evidence shows the current implementation direction is wrong. Prefer rollback over stacking speculative repair patches in those cases.",
-      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback <label> | <n> | run <n> [-- <continue prompt>], and /redo.",
+      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback (opens an interactive picker; direct forms <label> | <n> | run <n> [-- <continue prompt>]), and /redo.",
     ],
     parameters: Type.Object({
       targetLabel: Type.Optional(Type.String()),

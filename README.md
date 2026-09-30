@@ -12,24 +12,30 @@ Then restart Pi or run `/reload`. Review the source before installation: Pi exte
 
 ## Usage
 
-Checkpoints are saved automatically before and after every model turn, so `1` and `run 1` targets are always available. Name your own checkpoints with free-form text (spaces allowed):
+Checkpoints are saved automatically before and after every model turn, so undo targets always exist. The human model is "go back to when I said X": restore points anchor on your messages, not on model turns.
 
 ```text
-/checkpoint before the big refactor
-/checkpoints
-/rollback                              # one checkpoint back
+/rollback                              # interactive picker (TUI/RPC): one entry per message you sent
+/rollback                              # without dialogs (print/json): one checkpoint back
 /rollback 3                            # three checkpoints back
 /rollback before the big refactor      # fuzzy label match (case-insensitive)
 /rollback run 2                        # start of the run before last
 /rollback before refactor -- Try the smaller fix.
 /rollback entry:<session-entry-id>     # exact power-user form
+/checkpoint before the big refactor    # bare /checkpoint asks for a label via input dialog
+/checkpoints                           # grouped restore points (newest first, turn noise collapsed)
+/checkpoints all                       # raw turn-level list
+/checkpoints 60                        # last 60 raw checkpoints
+/checkpoints refactor                  # filter restore points by label or message text
 /redo
 /rollback-prune
 ```
 
+The picker and `/checkpoints` show each restore point as the message you sent at that moment, plus named checkpoints and `! before destructive command` guards; turn-level auto checkpoints are collapsed because they carry no human-readable meaning. Cancelling the picker (`Esc`) leaves everything untouched.
+
 Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number or `run <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`). The numeric target counts checkpoints, not whole agent runs.
 
-`/checkpoints` prints a friendly list with relative timestamps and the exact command that restores each entry, including run boundaries. It shows the last 20 by default; `/checkpoints 60` shows the last 60, `/checkpoints all` shows every entry, and `/checkpoints <text>` filters by label substring (all four restore forms work on the full checkpoint list, not just the visible window):
+`/checkpoints all` prints the raw turn-level list with relative timestamps and the exact command that restores each entry, including run boundaries. It shows every entry; `/checkpoints <n>` shows the last n (all four restore forms work on the full checkpoint list, not just the visible window):
 
 ```text
 Rollback checkpoints (oldest → newest):
