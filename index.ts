@@ -395,22 +395,30 @@ function describeCheckpoint(checkpoint: Checkpoint): string {
   return checkpoint.label;
 }
 
-function formatCheckpointList(ctx: CheckpointContext, now = Date.now()): string {
+function formatCheckpointList(ctx: CheckpointContext, now = Date.now(), view: { limit?: number; filter?: string } = {}): string {
   const all = checkpoints(ctx);
   if (!all.length) return "No rollback checkpoints yet — save one with /checkpoint <label>.";
-  const visible = all.slice(-20);
-  const hidden = all.length - visible.length;
-  const lines = visible.map((checkpoint, index) => {
-    const back = all.length - 1 - (hidden + index);
+  let indexed = all.map((checkpoint, index) => ({ checkpoint, index }));
+  if (view.filter) {
+    const needle = view.filter.toLowerCase();
+    indexed = indexed.filter((item) => item.checkpoint.label.toLowerCase().includes(needle));
+    if (!indexed.length) return `No rollback checkpoints matching "${view.filter}".`;
+  }
+  const limit = view.limit ?? 20;
+  const visible = limit <= 0 ? indexed : indexed.slice(-limit);
+  const hidden = indexed.length - visible.length;
+  const lines = visible.map(({ checkpoint, index }) => {
+    const back = all.length - 1 - index;
     const hints: string[] = [];
     if (back >= 1) hints.push(`/rollback ${back}`);
     const runStart = /^rollback-before-(\d+)-0$/.exec(checkpoint.label);
     if (runStart) hints.push(`/rollback run ${runStart[1]}`);
     const hint = hints.length ? `   (${hints.join(" · ")})` : "";
-    return `${String(hidden + index + 1).padStart(2)}. ${describeCheckpoint(checkpoint)} · ${relativeTime(checkpoint.createdAt, now)}` + hint;
+    return `${String(index + 1).padStart(2)}. ${describeCheckpoint(checkpoint)} · ${relativeTime(checkpoint.createdAt, now)}` + hint;
   });
-  const parts = ["Rollback checkpoints (oldest → newest):", ...lines.map((line) => `  ${line}`)];
-  if (hidden > 0) parts.push(`  … ${hidden} older hidden`);
+  const header = view.filter ? `Rollback checkpoints matching "${view.filter}" (oldest → newest):` : "Rollback checkpoints (oldest → newest):";
+  const parts = [header, ...lines.map((line) => `  ${line}`)];
+  if (hidden > 0) parts.push(`  … ${hidden} older hidden — /checkpoints <n> shows the last n, /checkpoints all shows every entry, /checkpoints <text> filters by label`);
   parts.push("Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo");
   return parts.join("\n");
 }
@@ -967,9 +975,18 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("checkpoints", {
-    description: "List rollback checkpoints with restore hints",
-    handler: async (_args, ctx) => {
-      if (ctx.hasUI) ctx.ui.notify(formatCheckpointList(ctx), "info");
+    description: "List rollback checkpoints: /checkpoints [n | all | <filter text>]",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) return;
+      const input = args.trim();
+      try {
+        if (!input) ctx.ui.notify(formatCheckpointList(ctx), "info");
+        else if (/^all$/i.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: 0 }), "info");
+        else if (/^\d+$/.test(input)) ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { limit: Math.max(1, Number(input)) }), "info");
+        else ctx.ui.notify(formatCheckpointList(ctx, Date.now(), { filter: input }), "info");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     },
   });
   pi.registerCommand("rollback-prune", {

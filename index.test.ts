@@ -875,3 +875,47 @@ test("checkpoints listing shows friendly restore hints", async () => {
   assert.match(text, /\(\/rollback \d+( · \/rollback run \d+)?\)/);
   assert.match(text, /Restore with: \/rollback <label> · \/rollback <n> · \/rollback run <n> · \/redo/);
 });
+
+test("checkpoints listing can expand and filter beyond the default window", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-window-"));
+  cleanup.push(cwd);
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  for (let turn = 0; turn < 13; turn += 1) {
+    await run.handlers.turn_start!({ turnIndex: turn }, run.ctx);
+    await run.handlers.turn_end!({ turnIndex: turn }, run.ctx);
+  }
+  await run.commands.checkpoint!("before the big refactor", run.ctx);
+  for (let turn = 13; turn < 15; turn += 1) {
+    await run.handlers.turn_start!({ turnIndex: turn }, run.ctx);
+    await run.handlers.turn_end!({ turnIndex: turn }, run.ctx);
+  }
+
+  run.notifications.length = 0;
+  await run.commands.checkpoints!("", run.ctx);
+  const defaultView = run.notifications.at(-1)!;
+  assert.match(defaultView, /older hidden/);
+
+  run.notifications.length = 0;
+  await run.commands.checkpoints!("all", run.ctx);
+  const allView = run.notifications.at(-1)!;
+  assert.doesNotMatch(allView, /older hidden/);
+  assert.match(allView, /run 1 turn 0 start/);
+
+  run.notifications.length = 0;
+  await run.commands.checkpoints!("60", run.ctx);
+  const wideView = run.notifications.at(-1)!;
+  assert.doesNotMatch(wideView, /older hidden/);
+
+  run.notifications.length = 0;
+  await run.commands.checkpoints!("big refactor", run.ctx);
+  const filteredView = run.notifications.at(-1)!;
+  assert.match(filteredView, /matching "big refactor"/);
+  assert.match(filteredView, /before the big refactor/);
+  assert.doesNotMatch(filteredView, /run 1 turn 0 start/);
+
+  run.notifications.length = 0;
+  await run.commands.checkpoints!("no-such-label", run.ctx);
+  assert.match(run.notifications.at(-1)!, /No rollback checkpoints matching/);
+});

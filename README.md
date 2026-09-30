@@ -29,7 +29,7 @@ Checkpoints are saved automatically before and after every model turn, so `1` an
 
 Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number or `run <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`). The numeric target counts checkpoints, not whole agent runs.
 
-`/checkpoints` prints a friendly list with relative timestamps and the exact command that restores each entry, including run boundaries:
+`/checkpoints` prints a friendly list with relative timestamps and the exact command that restores each entry, including run boundaries. It shows the last 20 by default; `/checkpoints 60` shows the last 60, `/checkpoints all` shows every entry, and `/checkpoints <text>` filters by label substring (all four restore forms work on the full checkpoint list, not just the visible window):
 
 ```text
 Rollback checkpoints (oldest → newest):
@@ -37,6 +37,7 @@ Rollback checkpoints (oldest → newest):
   2. run 1 turn 0 end · auto · 11m ago     (/rollback 3)
   3. before the big refactor · 9m ago      (/rollback 2)
   4. run 2 turn 0 start · auto · 4m ago    (/rollback 1 · /rollback run 2)
+  … 133 older hidden — /checkpoints <n> shows the last n, /checkpoints all shows every entry, /checkpoints <text> filters by label
 Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo
 ```
 
