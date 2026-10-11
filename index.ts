@@ -43,6 +43,8 @@ const REDO_TYPE = "pi-rollback-redo";
 export const ROLLBACK_RESULT_EVENT = "pi-rollback:result";
 const SNAPSHOT_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots");
 const VERSION = 2;
+const RUN_START_LABEL = /^rollback-before-(\d+)-0$/;
+const isRunStartLabel = (label: string): boolean => RUN_START_LABEL.test(label);
 
 type RootState = { root: string; tree: string; storeBase: string };
 type Mutation = FileMutation | RootMutation;
@@ -399,7 +401,6 @@ function describeCheckpoint(checkpoint: Checkpoint): string {
 }
 
 const AUTO_TURN_LABEL = /^rollback-(before|after)-\d+-\d+$/;
-const RUN_START_LABEL = /^rollback-before-(\d+)-0$/;
 
 function firstUserText(entry: SessionEntry): string {
   const message = entry.message;
@@ -442,21 +443,19 @@ export function buildRestoreMenu(ctx: BranchContext): RestoreOption[] {
     const text = firstUserText(entry);
     if (text) snippets.set(entry.id, snippet(text));
   }
-  let latestRun = 0;
-  for (const checkpoint of all) {
-    const match = RUN_START_LABEL.exec(checkpoint.label);
-    if (match) latestRun = Math.max(latestRun, Number(match[1]));
-  }
+  const starts = all.filter((checkpoint) => isRunStartLabel(checkpoint.label));
+  const latestRun = starts.length ? Number(RUN_START_LABEL.exec(starts.at(-1)!.label)![1]) : 0;
   const options: RestoreOption[] = [];
   for (const checkpoint of [...all].reverse()) {
     const runStart = RUN_START_LABEL.exec(checkpoint.label);
     if (runStart) {
       const runNo = Number(runStart[1]);
+      const runCount = starts.length - starts.indexOf(checkpoint);
       const message = snippets.get(checkpoint.entryId);
       const ago = relativeTime(checkpoint.createdAt);
       const current = runNo === latestRun ? " · current run" : "";
       const display = message ? `“${message}” · ${ago}${current}` : `start of run ${runNo} · ${ago}${current}`;
-      options.push({ display, args: { targetLabel: checkpoint.label }, command: `/rollback run ${latestRun - runNo + 1}`, message });
+      options.push({ display, args: { targetLabel: checkpoint.label }, command: `/rollback run ${runCount}`, message });
       continue;
     }
     if (checkpoint.label.startsWith("auto-before-destructive")) {
@@ -498,8 +497,12 @@ function formatCheckpointList(ctx: CheckpointContext, now = Date.now(), view: { 
     const back = all.length - 1 - index;
     const hints: string[] = [];
     if (back >= 1) hints.push(`/rollback ${back}`);
-    const runStart = /^rollback-before-(\d+)-0$/.exec(checkpoint.label);
-    if (runStart) hints.push(`/rollback run ${runStart[1]}`);
+    const runStart = RUN_START_LABEL.exec(checkpoint.label);
+    if (runStart) {
+      const starts = all.filter((item) => isRunStartLabel(item.label));
+      const runCount = starts.length - starts.indexOf(checkpoint);
+      if (runCount >= 1) hints.push(`/rollback run ${runCount}`);
+    }
     const hint = hints.length ? `   (${hints.join(" · ")})` : "";
     return `${String(index + 1).padStart(2)}. ${describeCheckpoint(checkpoint)} · ${relativeTime(checkpoint.createdAt, now)}` + hint;
   });
@@ -555,7 +558,7 @@ function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint 
     throw new Error(`No active checkpoint labelled ${args.targetLabel}`);
   }
   if (args.runCount !== undefined) {
-    const starts = all.filter((checkpoint) => /^rollback-before-\d+-0$/.test(checkpoint.label));
+    const starts = all.filter((checkpoint) => isRunStartLabel(checkpoint.label));
     const target = starts.length - args.runCount;
     if (!Number.isInteger(args.runCount) || args.runCount < 1 || target < 0) {
       throw new Error(`Can roll back at most ${starts.length} agent run(s)`);
@@ -845,7 +848,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       // let commit-hook edits be silently destroyed by rollback — observed on
       // 2026-09-30 with three 0.99.1 adaptation files.)
       await captureExternalChanges(ctx);
-      await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${event.turnIndex}`, sandboxed, labeledEntries);
+      await saveCheckpoint(pi, ctx, `rollback-before-${agentRun}-${currentTurnIndex}`, sandboxed, labeledEntries);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
     }
@@ -855,7 +858,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     try {
       protectCurrent(ctx);
       await flushPending(ctx);
-      await saveCheckpoint(pi, ctx, `rollback-after-${agentRun}-${event.turnIndex}`, sandboxed, labeledEntries);
+      await saveCheckpoint(pi, ctx, `rollback-after-${agentRun}-${currentTurnIndex}`, sandboxed, labeledEntries);
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
     }
