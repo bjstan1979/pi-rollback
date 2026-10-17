@@ -8,7 +8,6 @@ import {
   realpathSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
@@ -83,12 +82,17 @@ export function restoreFileState(path: string, state: FileState, blobRoot = BLOB
   }
   const content = readFileSync(blobPath(state.blob, blobRoot));
   if (createHash("sha256").update(content).digest("hex") !== state.blob) throw new Error(`Corrupt rollback blob: ${state.blob}`);
+  // Fail closed like the "missing" branch above: a directory that took the
+  // file's place may hold unrelated, unjournaled work, so refusing is safer
+  // than recursively deleting it to restore one file.
+  if (existsSync(path) && lstatSync(path).isDirectory()) {
+    throw new Error(`Refusing to replace directory with a restored file: ${path} (move the directory aside first)`);
+  }
   mkdirSync(dirname(path), { recursive: true });
   const temporary = join(dirname(path), `.${basename(path)}.pi-rollback-${process.pid}-${randomUUID()}`);
   try {
     writeFileSync(temporary, content, { mode: state.mode });
     chmodSync(temporary, state.mode);
-    if (existsSync(path) && statSync(path).isDirectory()) rmSync(path, { recursive: true, force: true });
     renameSync(temporary, path);
   } finally {
     if (existsSync(temporary)) rmSync(temporary, { force: true });

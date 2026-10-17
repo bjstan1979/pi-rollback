@@ -589,14 +589,40 @@ function addRoot(roots: Set<string>, root: string): void {
   roots.add(absolute);
 }
 
-async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before" | "after", sandboxed: boolean, cwd: string, blobRoot?: string): Promise<number> {
+type AppliedState =
+  | { kind: "file"; path: string; state: FileState }
+  | { kind: "root"; root: string; tree: string; storeBase: string };
+
+/**
+ * Apply one journaled mutation and return the exact state it replaced, so a
+ * later failure can restore the workspace byte-for-byte. Replaying the
+ * journaled `after`/`before` state is NOT equivalent: out-of-band edits made
+ * after the mutation was recorded would be silently discarded.
+ */
+async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before" | "after", sandboxed: boolean, cwd: string, blobRoot?: string): Promise<{ files: number; undo?: AppliedState }> {
   if (mutation.kind === "file") {
     if (sandboxed && !isWithin(cwd, mutation.path)) throw new Error(`Sandbox rollback refused external path: ${mutation.path}`);
+    const undo: AppliedState = { kind: "file", path: mutation.path, state: captureFileState(mutation.path, blobRoot) };
     restoreFileState(mutation.path, mutation[side], blobRoot);
-    return 1;
+    return { files: 1, undo };
   }
   if (sandboxed && resolve(mutation.root) !== resolve(cwd)) throw new Error(`Sandbox rollback refused external root: ${mutation.root}`);
-  return (await restore(pi, mutation.root, mutation[side], mutation.storeBase)).files;
+  const restored = await restore(pi, mutation.root, mutation[side], mutation.storeBase);
+  return { files: restored.files, undo: { kind: "root", root: mutation.root, tree: restored.before, storeBase: mutation.storeBase } };
+}
+
+async function undoApplied(pi: ExtensionAPI, applied: AppliedState[], blobRoot: string | undefined, onError: (message: string) => void): Promise<number> {
+  let failures = 0;
+  for (const state of [...applied].reverse()) {
+    try {
+      if (state.kind === "file") restoreFileState(state.path, state.state, blobRoot);
+      else await restore(pi, state.root, state.tree, state.storeBase);
+    } catch (error) {
+      failures += 1;
+      onError(`Rollback recovery could not restore ${state.kind === "file" ? state.path : state.root}: ${String(error)}`);
+    }
+  }
+  return failures;
 }
 
 async function captureRedoGuards(pi: ExtensionAPI, selected: Mutation[], blobRoot?: string): Promise<Pick<RedoRecord, "fileGuards" | "rootGuards">> {
@@ -787,7 +813,6 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       // capture a workspace tree baseline so the damage is revertible even with
       // deep tracking disabled. bash changes are otherwise unjournaled by default.
       if (isShell && guardDestructive && command && isDestructiveCommand(command) && guardedTurn !== `${agentRun}:${currentTurnIndex}`) {
-        guardedTurn = `${agentRun}:${currentTurnIndex}`;
         try {
           await flushPending(ctx);
           await saveCheckpoint(pi, ctx, `auto-before-destructive-${agentRun}-${currentTurnIndex}`, sandboxed, labeledEntries);
@@ -796,7 +821,10 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
             const storeBase = sessionStore(ctx.sessionManager.getSessionId(), normalLayoutRoot);
             pendingRoots.set(root, { root, before: await capture(pi, root, storeBase), storeBase });
           }
+          guardedTurn = `${agentRun}:${currentTurnIndex}`;
         } catch (guardError) {
+          // Leave the turn unguarded so a later destructive command retries
+          // instead of losing protection for the rest of the turn.
           notify(ctx, `Rollback destructive guard skipped: ${String(guardError)}`);
         }
       }
@@ -815,6 +843,19 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // The extension instance outlives a single session in long-lived agents.
+    // Reset per-session bookkeeping so run/turn labels restart deterministically,
+    // and never flush captures that belong to the previous session's branch into
+    // the new session's journal.
+    agentRun = 0;
+    currentTurnIndex = 0;
+    guardedTurn = undefined;
+    labeledEntries.clear();
+    if (pendingFiles.size || pendingRoots.size) {
+      notify(ctx, `Rollback dropped ${pendingFiles.size + pendingRoots.size} unflushed capture(s) from the previous session`);
+      pendingFiles.clear();
+      pendingRoots.clear();
+    }
     try {
       executePrune(ctx, true);
     } catch (error) {
@@ -890,7 +931,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       let files = 0;
       let sandboxBefore: string | undefined;
       let redo: RedoRecord;
-      const reverted: Mutation[] = [];
+      const applied: AppliedState[] = [];
       const selected = mutations(ctx).filter((item) => item.seq > target!.seq).sort((a, b) => b.seq - a.seq);
       if (sandboxed && target.mode !== "sandbox") throw new Error("Sandbox rollback refuses checkpoints created outside sandbox mode");
 
@@ -912,8 +953,9 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       } else {
         try {
           for (const mutation of selected) {
-            files += await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
-            reverted.push(mutation);
+            const outcome = await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
+            files += outcome.files;
+            if (outcome.undo) applied.push(outcome.undo);
           }
           redo = {
             version: 1,
@@ -926,7 +968,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
             createdAt: Date.now(),
           };
         } catch (error) {
-          for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
+          await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
           throw error;
         }
       }
@@ -940,12 +982,12 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         });
       } catch (error) {
         if (sandboxBefore && target.sandbox) await restore(pi, target.sandbox.root, sandboxBefore, target.sandbox.storeBase);
-        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
+        await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
         throw error;
       }
       if (result.cancelled) {
         if (sandboxBefore && target.sandbox) await restore(pi, target.sandbox.root, sandboxBefore, target.sandbox.storeBase);
-        for (const mutation of [...reverted].reverse()) await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
+        await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
         publishRollbackResult({
           requestId: args.requestId,
           ok: false,
@@ -998,7 +1040,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       const redo = active.data;
       let files = 0;
       let sandboxBefore: string | undefined;
-      const applied: Mutation[] = [];
+      const applied: AppliedState[] = [];
 
       if (redo.mode === "sandbox") {
         if (!sandboxed || !redo.sandbox) throw new Error("Sandbox redo can only run inside its original sandbox workspace");
@@ -1013,11 +1055,12 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         await assertRedoGuards(pi, redo, options.blobRoot);
         try {
           for (const mutation of redo.mutations ?? []) {
-            files += await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
-            applied.push(mutation);
+            const outcome = await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);
+            files += outcome.files;
+            if (outcome.undo) applied.push(outcome.undo);
           }
         } catch (error) {
-          for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
+          await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
           throw error;
         }
       }
@@ -1027,12 +1070,12 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         result = await ctx.navigateTree(redo.sourceEntryId, { summarize: false });
       } catch (error) {
         if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
-        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
+        await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
         throw error;
       }
       if (result.cancelled) {
         if (sandboxBefore && redo.sandbox) await restore(pi, redo.sandbox.root, sandboxBefore, redo.sandbox.storeBase);
-        for (const mutation of [...applied].reverse()) await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
+        await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
         throw new Error("Redo cancelled");
       }
       if (ctx.hasUI) ctx.ui.notify(`Redid ${files} file(s) and restored checkpoint branch ${redo.targetLabel}`, "info");

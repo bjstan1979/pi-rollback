@@ -736,6 +736,22 @@ test("restoreFileState refuses to recursively delete a directory for missing sta
   assert.equal(readFileSync(join(dir, "critical.txt"), "utf8"), "precious data\n");
 });
 
+test("restoreFileState refuses to replace a directory with a restored file", () => {
+  const base = mkdtempSync(join(tmpdir(), "pi-rollback-file-over-dir-"));
+  const target = join(base, "path");
+  writeFileSync(target, "journaled file\n");
+  const state = captureFileState(target);
+  rmSync(target);
+  mkdirSync(join(target, "nested"), { recursive: true });
+  writeFileSync(join(target, "nested", "unrelated.txt"), "unrelated work\n");
+  cleanup.push(base);
+
+  // A directory that took the file's place may hold unjournaled work, so the
+  // restore must fail closed instead of deleting it recursively.
+  assert.throws(() => restoreFileState(target, state), /Refusing to replace directory with a restored file/);
+  assert.equal(readFileSync(join(target, "nested", "unrelated.txt"), "utf8"), "unrelated work\n");
+});
+
 test("excludeNestedStore excludes parent .rollback-snapshots directory in sandbox mode", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-sandbox-exclude-"));
   cleanup.push(cwd);
@@ -828,6 +844,58 @@ test("destructive shell commands are auto-guarded and revertible by default", as
   assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), true);
   await run.commands.rollback!("destructive", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "precious\n");
+});
+
+test("cancelled rollback restores the exact pre-rollback tree instead of the journaled after-state", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-cancel-exact-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "v1\n");
+  const run = harness(cwd, { deepTracking: true });
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("base", run.ctx);
+  // A shell write is journaled as a workspace tree snapshot.
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "echo v2 > demo.txt" } }, run.ctx);
+  writeFileSync(file, "v2\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  assert.equal(run.entries.filter((entry) => entry.data?.kind === "root").length, 1);
+
+  // An out-of-band edit nothing reconciles, made after the last capture.
+  writeFileSync(file, "external\n");
+  run.ctx.navigateTree = async () => ({ cancelled: true });
+  await run.commands.rollback!("base", run.ctx);
+
+  assert.equal(readFileSync(file, "utf8"), "external\n");
+  assert.equal(run.entries.some((entry) => entry.customType === "pi-rollback-redo"), false);
+});
+
+test("session switch resets run counters and drops unflushed captures", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-session-switch-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "s.txt");
+  writeFileSync(file, "one\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  const checkpointLabels = () => run.entries.map((entry) => entry.data?.label).filter(Boolean);
+  assert.equal(checkpointLabels().at(-1), "rollback-before-1-0");
+
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "two\n");
+  const journaledFiles = () => run.entries.filter((entry) => entry.data?.kind === "file").length;
+  const before = journaledFiles();
+
+  // Abrupt switch: no session_shutdown, so the capture is still pending.
+  await run.handlers.session_start!({}, run.ctx);
+  assert.equal(run.notifications.some((message) => message.includes("dropped 1 unflushed capture")), true);
+  assert.equal(journaledFiles(), before, "the new session journal must not absorb the old capture");
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  assert.equal(checkpointLabels().at(-1), "rollback-before-1-0", "run counters restart per session");
 });
 
 test("destructive guard can be disabled via PI_ROLLBACK_GUARD_DESTRUCTIVE", async () => {
