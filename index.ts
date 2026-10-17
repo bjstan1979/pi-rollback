@@ -40,6 +40,7 @@ const CHECKPOINT_TYPE = "pi-rollback-checkpoint";
 const MUTATION_TYPE = "pi-rollback-mutation";
 const RESULT_TYPE = "pi-rollback-result";
 const REDO_TYPE = "pi-rollback-redo";
+const CONTEXT_MESSAGE_TYPE = "pi-rollback-context";
 export const ROLLBACK_RESULT_EVENT = "pi-rollback:result";
 const SNAPSHOT_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots");
 const VERSION = 2;
@@ -401,6 +402,8 @@ function describeCheckpoint(checkpoint: Checkpoint): string {
 }
 
 const AUTO_TURN_LABEL = /^rollback-(before|after)-\d+-\d+$/;
+// Labels the extension generates itself; they carry no human/agent-meaningful name.
+const GENERATED_LABEL = /^(?:rollback-(?:before|after)-\d+-\d+|auto-before-destructive-\d+-\d+|checkpoint-\d{8}-\d{6})$/;
 
 function firstUserText(entry: SessionEntry): string {
   const message = entry.message;
@@ -668,6 +671,14 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   let agentRun = 0;
   let currentTurnIndex = 0;
   let guardedTurn: string | undefined;
+  // Sticky context notes: the last rollback outcome (shown for the turn that
+  // follows it) and the named restore points (shown once, and again whenever the
+  // set changes) so the model can observe that rollback is available and worked.
+  let announcedResultKey: string | undefined;
+  let announcedResultTurn: string | undefined;
+  let announcedResultText: string | undefined;
+  let announcedPointsKey: string | undefined;
+  let announcedPointsText: string | undefined;
   const labeledEntries = new Set<string>();
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
@@ -850,6 +861,11 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     agentRun = 0;
     currentTurnIndex = 0;
     guardedTurn = undefined;
+    announcedResultKey = undefined;
+    announcedResultTurn = undefined;
+    announcedResultText = undefined;
+    announcedPointsKey = undefined;
+    announcedPointsText = undefined;
     labeledEntries.clear();
     if (pendingFiles.size || pendingRoots.size) {
       notify(ctx, `Rollback dropped ${pendingFiles.size + pendingRoots.size} unflushed capture(s) from the previous session`);
@@ -903,6 +919,76 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     } catch (error) {
       notify(ctx, `Rollback checkpoint skipped: ${String(error)}`);
     }
+  });
+
+  const turnKey = (): string => `${agentRun}:${currentTurnIndex}`;
+
+  const clip = (value: string, max = 80): string => (value.length > max ? `${value.slice(0, max)}…` : value);
+
+  /**
+   * Notes the model otherwise never sees: a rollback truncates the branch (the
+   * call and its outcome vanish) and the result entry has no other consumer, so
+   * without this projection the model cannot tell whether a rollback happened,
+   * succeeded, or restored anything. Bounded: the outcome line lives for one
+   * turn; the restore-point line is emitted once per set of named checkpoints.
+   */
+  const rollbackContextNote = (ctx: BranchContext): string | undefined => {
+    const result = activeEntries(ctx).reduce<RollbackResult | undefined>((latest, entry) => {
+      if (entry.type !== "custom" || entry.customType !== RESULT_TYPE) return latest;
+      const data = entry.data as RollbackResult | undefined;
+      return data?.version === 1 ? data : latest;
+    }, undefined);
+    if (result) {
+      const key = `${result.createdAt}:${result.ok ? "ok" : "failed"}:${result.files ?? 0}`;
+      if (key !== announcedResultKey) {
+        announcedResultKey = key;
+        announcedResultTurn = turnKey();
+        announcedResultText = result.ok
+          ? `Last rollback succeeded: restored ${result.files ?? 0} file(s) to checkpoint "${clip(result.targetLabel ?? result.targetEntryId ?? "unknown")}".`
+          : `Last rollback did not complete: ${clip(result.error ?? "unknown error", 200)}.`;
+      } else if (announcedResultTurn !== turnKey()) {
+        announcedResultText = undefined;
+      }
+    }
+    const named = checkpoints(ctx).filter((checkpoint) => !GENERATED_LABEL.test(checkpoint.label));
+    if (named.length) {
+      const signature = named.map((checkpoint) => `${checkpoint.entryId}:${checkpoint.label}`).join("|");
+      if (signature !== announcedPointsKey) {
+        announcedPointsKey = signature;
+        const recent = named.slice(-5).map((checkpoint) => `"${clip(checkpoint.label, 60)}"`).join(", ");
+        announcedPointsText = `Named restore points (newest last): ${recent}. Save one with checkpoint({label:"..."}) before risky work; restore with rollback({targetLabel:"..."}).`;
+      }
+    } else {
+      announcedPointsKey = undefined;
+      announcedPointsText = undefined;
+    }
+    const lines = [announcedResultText, announcedPointsText].filter(Boolean) as string[];
+    return lines.length ? lines.join("\n") : undefined;
+  };
+
+  pi.on("context", (event, ctx) => {
+    let note: string | undefined;
+    try {
+      note = rollbackContextNote(ctx as BranchContext);
+    } catch {
+      return undefined;
+    }
+    const kept = event.messages.filter(
+      (message) => (message as { customType?: string } | null)?.customType !== CONTEXT_MESSAGE_TYPE,
+    );
+    if (!note) return kept.length === event.messages.length ? undefined : { messages: kept as typeof event.messages };
+    return {
+      messages: [
+        ...kept,
+        {
+          role: "custom",
+          customType: CONTEXT_MESSAGE_TYPE,
+          content: `[pi-rollback]\n${note}`,
+          display: false,
+          timestamp: 0,
+        },
+      ] as typeof event.messages,
+    };
   });
 
   const publishRollbackResult = (result: Omit<RollbackResult, "version" | "createdAt">): RollbackResult => {

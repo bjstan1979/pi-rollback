@@ -406,6 +406,45 @@ test("normal mode rollback and redo restore files plus the original checkpoint b
   assert.deepEqual(run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []), originalLabels);
 });
 
+test("projects the last rollback outcome and named restore points into context", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-context-note-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+  const noteOf = (result: any) => (result?.messages as any[] | undefined)?.find((message) => message.customType === "pi-rollback-context");
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("before edits", run.ctx);
+
+  // The model has no other way to learn that named restore points exist.
+  const first = await run.handlers.context!({ messages: [{ role: "user", content: "continue" }] }, run.ctx);
+  assert.match(noteOf(first).content, /Named restore points/);
+  assert.match(noteOf(first).content, /"before edits"/);
+  assert.match(noteOf(first).content, /targetLabel/);
+
+  // Re-projecting the same state must not stack notes.
+  const second = await run.handlers.context!({ messages: first.messages }, run.ctx);
+  assert.equal((second.messages as any[]).filter((message) => message.customType === "pi-rollback-context").length, 1);
+
+  // A rollback truncates the branch, so the outcome is invisible without this.
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  await run.commands.rollback!("before edits", run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  const third = await run.handlers.context!({ messages: [] }, run.ctx);
+  assert.match(noteOf(third).content, /Last rollback succeeded/);
+  assert.match(noteOf(third).content, /"before edits"/);
+  assert.equal(readFileSync(file, "utf8"), "original\n");
+
+  // ... and the outcome line expires after that turn instead of lingering.
+  await run.handlers.turn_start!({ turnIndex: 2 }, run.ctx);
+  const fourth = await run.handlers.context!({ messages: [] }, run.ctx);
+  assert.equal(noteOf(fourth), undefined);
+});
+
 test("redo refuses to overwrite changes made after rollback", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-redo-guard-"));
   cleanup.push(cwd, snapshotDir(cwd));
@@ -622,7 +661,7 @@ test("registers mutation hooks and commands", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-register-"));
   cleanup.push(cwd);
   const run = harness(cwd);
-  assert.deepEqual(Object.keys(run.handlers), ["tool_call", "session_start", "session_shutdown", "agent_start", "turn_start", "turn_end", "agent_settled"]);
+  assert.deepEqual(Object.keys(run.handlers), ["tool_call", "session_start", "session_shutdown", "agent_start", "turn_start", "turn_end", "context", "agent_settled"]);
   assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback-prune", "rollback", "redo"]);
   assert.deepEqual(run.tools, ["checkpoint", "rollback"]);
 });
