@@ -89,6 +89,9 @@ export interface RollbackArgs {
   labelQuery?: string;
   targetEntryId?: string;
   count?: number;
+  /** N turns back, landing at the end of the turn N back. */
+  turnCount?: number;
+  /** N agent runs back, landing at the start of that run. */
   runCount?: number;
   requestId?: string;
   continuePrompt?: string;
@@ -129,7 +132,16 @@ interface SessionEntry {
   type: string;
   customType?: string;
   data?: unknown;
-  message?: { role?: string; content?: unknown };
+  message?: {
+    role?: string;
+    content?: unknown;
+    toolCallId?: string;
+    tool_name?: string;
+    toolName?: string;
+    isError?: boolean;
+    is_error?: boolean;
+    details?: { isError?: boolean; error?: unknown; [key: string]: unknown };
+  };
 }
 
 type CheckpointContext = Pick<ExtensionCommandContext, "sessionManager" | "cwd" | "hasUI" | "ui">;
@@ -305,6 +317,74 @@ function activeRedo(ctx: BranchContext): ActiveRedo | undefined {
   return entry ? { entryId: entry.id, data: entry.data as RedoRecord } : undefined;
 }
 
+const MUTATION_TOOL_NAMES = new Set(["write", "edit", "undo_last_edit", "ts_morph"]);
+
+/** Walk back from a tool result to the assistant call that produced it. */
+function findToolCall(
+  entries: readonly SessionEntry[],
+  resultIndex: number,
+  toolCallId: string | undefined,
+  toolName: string | undefined,
+): { name: string; args: Record<string, unknown> } | undefined {
+  for (let index = resultIndex - 1; index >= 0; index -= 1) {
+    const message = entries[index]?.message;
+    if (!message || message.role !== "assistant") continue;
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const call = block as { type?: string; id?: string; name?: string; arguments?: unknown };
+      if (call.type !== "toolCall" && call.type !== "tool_call") continue;
+      const matches = toolCallId ? call.id === toolCallId : (!toolName || call.name === toolName);
+      if (!matches) continue;
+      return { name: call.name ?? toolName ?? "tool", args: (call.arguments ?? {}) as Record<string, unknown> };
+    }
+  }
+  return undefined;
+}
+
+function toolResultFailed(message: NonNullable<SessionEntry["message"]>): boolean {
+  return Boolean(message.isError || message.is_error || message.details?.isError || message.details?.error);
+}
+
+/**
+ * Detect repeated failed file mutations: two consecutive failed attempts on the
+ * same path (a successful mutation resets that path's streak). Used to nudge the
+ * model toward undo_last_edit/rollback instead of stacking another patch.
+ */
+export function fileEditFailureStreak(
+  entries: readonly SessionEntry[],
+  window = 24,
+): { path: string; failures: number } | undefined {
+  const streaks = new Map<string, number>();
+  // A success settles that target: older failures belong to a previous episode
+  // and must not resurface on the next scan.
+  const settled = new Set<string>();
+  let inspected = 0;
+  for (let index = entries.length - 1; index >= 0 && inspected < window; index -= 1) {
+    const message = entries[index]?.message;
+    if (!message || (message.role !== "toolResult" && message.role !== "tool_result")) continue;
+    const toolName = message.toolName ?? message.tool_name;
+    if (!toolName || !MUTATION_TOOL_NAMES.has(toolName)) continue;
+    const call = findToolCall(entries, index, message.toolCallId, toolName);
+    const target = typeof call?.args.path === "string"
+      ? call.args.path
+      : typeof call?.args.filePath === "string"
+        ? call.args.filePath
+        : toolName;
+    inspected += 1;
+    if (!toolResultFailed(message)) {
+      streaks.delete(target);
+      settled.add(target);
+      continue;
+    }
+    if (settled.has(target)) continue;
+    const failures = (streaks.get(target) ?? 0) + 1;
+    streaks.set(target, failures);
+    if (failures >= 2) return { path: target, failures };
+  }
+  return undefined;
+}
+
 function currentSeq(ctx: BranchContext): number {
   return mutations(ctx).reduce((max, item) => Math.max(max, item.seq), 0);
 }
@@ -346,7 +426,7 @@ async function saveCheckpoint(pi: ExtensionAPI, ctx: CheckpointContext, label: s
   return checkpoint;
 }
 
-function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId" | "targetLabel" | "runCount" | "labelQuery"> {
+function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId" | "targetLabel" | "runCount" | "turnCount" | "labelQuery"> {
   const input = value.trim();
   if (!input) return { count: 1 };
   if (/^\d+$/.test(input)) return { count: Number(input) };
@@ -357,6 +437,8 @@ function humanTarget(value: string): Pick<RollbackArgs, "count" | "targetEntryId
   }
   const runMatch = /^runs?\s+(\d+)$/i.exec(input);
   if (runMatch) return { runCount: Number(runMatch[1]) };
+  const turnMatch = /^turns?\s+(\d+)$/i.exec(input);
+  if (turnMatch) return { turnCount: Number(turnMatch[1]) };
   // Free-form label, spaces allowed. Use the explicit `label:` prefix only to
   // disambiguate a label that itself looks like another target form.
   const targetLabel = input.startsWith("label:") ? input.slice("label:".length).trim() : input;
@@ -402,6 +484,7 @@ function describeCheckpoint(checkpoint: Checkpoint): string {
 }
 
 const AUTO_TURN_LABEL = /^rollback-(before|after)-\d+-\d+$/;
+const TURN_END_LABEL = /^rollback-after-\d+-\d+$/;
 // Labels the extension generates itself; they carry no human/agent-meaningful name.
 const GENERATED_LABEL = /^(?:rollback-(?:before|after)-\d+-\d+|auto-before-destructive-\d+-\d+|checkpoint-\d{8}-\d{6})$/;
 
@@ -512,18 +595,18 @@ function formatCheckpointList(ctx: CheckpointContext, now = Date.now(), view: { 
   const header = view.filter ? `Rollback checkpoints matching "${view.filter}" (oldest → newest):` : "Rollback checkpoints (oldest → newest):";
   const parts = [header, ...lines.map((line) => `  ${line}`)];
   if (hidden > 0) parts.push(`  … ${hidden} older hidden — /checkpoints <n> shows the last n, /checkpoints all shows every entry, /checkpoints <text> filters by label`);
-  parts.push("Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo");
+  parts.push("Restore with: /rollback <label> · /rollback <n> (checkpoints back) · /rollback run <n> · /rollback turn <n> · /redo");
   return parts.join("\n");
 }
 function jsonRollbackArgs(value: unknown): RollbackArgs {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Rollback JSON must be an object");
   const args = value as Record<string, unknown>;
-  const allowed = new Set(["targetLabel", "targetEntryId", "count", "runCount", "requestId", "continuePrompt", "summarize"]);
+  const allowed = new Set(["targetLabel", "targetEntryId", "count", "turnCount", "runCount", "requestId", "continuePrompt", "summarize"]);
   for (const key of Object.keys(args)) if (!allowed.has(key)) throw new Error(`Unknown rollback option: ${key}`);
   for (const key of ["targetLabel", "targetEntryId", "requestId", "continuePrompt"]) {
     if (args[key] !== undefined && typeof args[key] !== "string") throw new Error(`Rollback ${key} must be a string`);
   }
-  for (const key of ["count", "runCount"]) {
+  for (const key of ["count", "turnCount", "runCount"]) {
     if (args[key] !== undefined && (!Number.isSafeInteger(args[key]) || (args[key] as number) < 1)) {
       throw new Error(`Rollback ${key} must be a positive integer`);
     }
@@ -544,14 +627,27 @@ export function parseRollbackArgs(raw: string): RollbackArgs {
   return { ...humanTarget(target), continuePrompt };
 }
 
-function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint {
-  const all = checkpoints(ctx);
-  if ((args.targetEntryId || args.targetLabel) && (args.count !== undefined || args.runCount !== undefined)) {
-    throw new Error("Rollback target is ambiguous");
-  }
-  if (args.count !== undefined && args.runCount !== undefined) throw new Error("Rollback target is ambiguous");
+type ResolvedCheckpoint = Checkpoint & {
+  /** The session entry that holds this checkpoint; navigating here keeps it. */
+  resolvedEntryId: string;
+};
+
+/** Checkpoints paired with the branch entry that stores them (navigation target). */
+export function resolvedCheckpoints(ctx: BranchContext): ResolvedCheckpoint[] {
+  return activeEntries(ctx)
+    .filter((entry) => entry.type === "custom" && entry.customType === CHECKPOINT_TYPE)
+    .filter((entry) => (entry.data as Partial<Checkpoint> | undefined)?.version === VERSION)
+    .sort((a, b) => ((a.data as Checkpoint).createdAt - (b.data as Checkpoint).createdAt))
+    .map((entry) => ({ ...(entry.data as Checkpoint), resolvedEntryId: entry.id }));
+}
+
+function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): ResolvedCheckpoint {
+  const all = resolvedCheckpoints(ctx);
+  const counts = [args.count, args.runCount, args.turnCount].filter((value) => value !== undefined);
+  if ((args.targetEntryId || args.targetLabel) && counts.length) throw new Error("Rollback target is ambiguous");
+  if (counts.length > 1) throw new Error("Rollback target is ambiguous");
   if (args.targetEntryId) {
-    const found = all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId);
+    const found = all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId || checkpoint.resolvedEntryId === args.targetEntryId);
     if (found) return found;
     throw new Error(`No active checkpoint for entry ${args.targetEntryId}`);
   }
@@ -567,6 +663,17 @@ function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): Checkpoint 
       throw new Error(`Can roll back at most ${starts.length} agent run(s)`);
     }
     return starts[target]!;
+  }
+  if (args.turnCount !== undefined) {
+    // turns=N undoes the last N completed turns: land at the end of the turn
+    // before them. The current turn has not ended yet, so `ends` holds the
+    // completed turns only.
+    const ends = all.filter((checkpoint) => TURN_END_LABEL.test(checkpoint.label));
+    const target = ends.length - 1 - args.turnCount;
+    if (!Number.isInteger(args.turnCount) || args.turnCount < 1 || target < 0) {
+      throw new Error(`Can roll back at most ${Math.max(0, ends.length - 1)} turn(s)`);
+    }
+    return ends[target]!;
   }
   const count = args.count ?? 1;
   const target = all.length - 1 - count;
@@ -679,6 +786,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   let announcedResultText: string | undefined;
   let announcedPointsKey: string | undefined;
   let announcedPointsText: string | undefined;
+  let announcedNudge: { key: string; text: string } | undefined;
   const labeledEntries = new Set<string>();
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
@@ -866,6 +974,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     announcedResultText = undefined;
     announcedPointsKey = undefined;
     announcedPointsText = undefined;
+    announcedNudge = undefined;
     labeledEntries.clear();
     if (pendingFiles.size || pendingRoots.size) {
       notify(ctx, `Rollback dropped ${pendingFiles.size + pendingRoots.size} unflushed capture(s) from the previous session`);
@@ -962,7 +1071,24 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       announcedPointsKey = undefined;
       announcedPointsText = undefined;
     }
-    const lines = [announcedResultText, announcedPointsText].filter(Boolean) as string[];
+    const streak = fileEditFailureStreak(activeEntries(ctx));
+    if (streak) {
+      const key = `${streak.path}:${turnKey()}`;
+      if (announcedNudge?.key !== key) {
+        const canRollback = checkpoints(ctx).some((checkpoint) => TURN_END_LABEL.test(checkpoint.label));
+        announcedNudge = {
+          key,
+          text: `${streak.failures} consecutive failed edit attempt(s) on ${clip(streak.path, 120)} — ${
+            canRollback
+              ? "consider undo_last_edit for the last change or rollback({turns:1}) instead of stacking another patch"
+              : "consider undo_last_edit for the last change instead of stacking another patch"
+          }.`,
+        };
+      }
+    } else {
+      announcedNudge = undefined;
+    }
+    const lines = [announcedResultText, announcedNudge?.text, announcedPointsText].filter(Boolean) as string[];
     return lines.length ? lines.join("\n") : undefined;
   };
 
@@ -999,7 +1125,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   };
 
   const runRollback = async (args: RollbackArgs, ctx: ExtensionCommandContext): Promise<void> => {
-    let target: Checkpoint | undefined;
+    let target: ResolvedCheckpoint | undefined;
     try {
       // Defense in depth: reconcile journal with disk before resolving the
       // target, so the selection covers out-of-band edits made within the
@@ -1030,7 +1156,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         redo = {
           version: 1,
           sourceEntryId,
-          targetEntryId: target.entryId,
+          targetEntryId: target.resolvedEntryId,
           targetLabel: target.label,
           mode: "sandbox",
           sandbox: { root: target.sandbox.root, rollbackTree: target.sandbox.tree, redoTree: restored.before, storeBase: target.sandbox.storeBase },
@@ -1046,7 +1172,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
           redo = {
             version: 1,
             sourceEntryId,
-            targetEntryId: target.entryId,
+            targetEntryId: target.resolvedEntryId,
             targetLabel: target.label,
             mode: "normal",
             mutations: [...selected].reverse(),
@@ -1061,7 +1187,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
 
       let result;
       try {
-        result = await ctx.navigateTree(target.entryId, {
+        result = await ctx.navigateTree(target.resolvedEntryId, {
           summarize: args.summarize !== false,
           customInstructions: "Keep only validated findings from the abandoned rollback branch.",
           label: `rollback-${target.label}`,
@@ -1077,7 +1203,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         publishRollbackResult({
           requestId: args.requestId,
           ok: false,
-          targetEntryId: target.entryId,
+          targetEntryId: target.resolvedEntryId,
           targetLabel: target.label,
           error: "Rollback cancelled",
         });
@@ -1086,7 +1212,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       publishRollbackResult({
         requestId: args.requestId,
         ok: true,
-        targetEntryId: target.entryId,
+        targetEntryId: target.resolvedEntryId,
         targetLabel: target.label,
         files,
       });
@@ -1250,7 +1376,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   pi.registerCommand("rollback", {
-    description: "Restore files and conversation — bare /rollback opens a picker; direct: /rollback <label> | <n> | run <n> [-- <continue prompt>]",
+    description: "Restore files and conversation — bare /rollback opens a picker; direct: /rollback <label> | <n> | run <n> | turn <n> [-- <continue prompt>]",
     handler: async (raw, ctx) => {
       protectCurrent(ctx);
       try {
@@ -1315,30 +1441,42 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   pi.registerTool({
     name: "rollback",
     label: "Rollback",
-    description: "Queue rollback to the start of this agent run, or restore an explicit checkpoint by label or entry ID.",
-    promptSnippet: "Roll back conversation and journaled workspace files to an earlier agent run or checkpoint",
+    description: "Queue a rollback: turns=N undoes the last N completed turns, runs=N returns to the start of the Nth agent run back, count=N counts checkpoints back, targetLabel restores a named checkpoint. With no target it returns to the start of the current agent run.",
+    promptSnippet: "Roll back conversation and journaled workspace files to an earlier turn, run, or checkpoint",
     promptGuidelines: [
-      "Save cheap checkpoints with the checkpoint tool before risky or hard-to-reverse work. Automatic checkpoints also bracket every model turn, and destructive shell commands are auto-guarded with a checkpoint plus a workspace snapshot you can roll back to (label prefix auto-before-destructive).",
-      "Use rollback when the user asks to undo or roll back your latest agent run; count is run-relative (default 1), while targetLabel/targetEntryId restore explicit checkpoints. The rollback is queued after the current turn, so stop making changes after calling it.",
-      "You may proactively roll back without waiting for the user when the same failure repeats, attempted fixes begin spreading across files or overwriting earlier work, or evidence shows the current implementation direction is wrong. Prefer rollback over stacking speculative repair patches in those cases.",
-      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback (opens an interactive picker; direct forms <label> | <n> | run <n> [-- <continue prompt>]), and /redo.",
+      "Call checkpoint with a short label before risky or hard-to-reverse work (bulk edits, migrations, destructive shell commands); it is cheap and makes an exact restore possible later. Automatic checkpoints already bracket every turn, and destructive shell commands are auto-guarded (label prefix auto-before-destructive).",
+      "rollback targets: turns=N undoes the last N completed turns (the useful default for a failed repair), runs=N returns to the start of the Nth agent run back, count=N counts checkpoints back like /rollback <n>, and targetLabel/targetEntryId restore an explicit checkpoint. With no target it returns to the start of the current run. The rollback is queued after the current turn, so stop making changes after calling it.",
+      "Roll back proactively, without waiting for the user, when the same failure repeats, when two consecutive attempts to change the same file both fail, when fixes start spreading across files or overwriting earlier work, or when the evidence shows the approach is wrong. Prefer rollback over stacking another speculative patch.",
+      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or an explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback (opens an interactive picker; direct forms <label> | <n> | run <n> | turn <n> [-- <continue prompt>]), and /redo.",
     ],
     parameters: Type.Object({
-      targetLabel: Type.Optional(Type.String()),
+      targetLabel: Type.Optional(Type.String({ description: "Exact or fuzzy label of a named checkpoint." })),
       targetEntryId: Type.Optional(Type.String()),
-      count: Type.Optional(Type.Integer({ minimum: 1 })),
+      count: Type.Optional(Type.Integer({ minimum: 1, description: "Number of checkpoints back, same as /rollback <n>." })),
+      turns: Type.Optional(Type.Integer({ minimum: 1, description: "Undo the last N completed turns." })),
+      runs: Type.Optional(Type.Integer({ minimum: 1, description: "Number of agent runs back, landing at the start of that run." })),
       continuePrompt: Type.Optional(Type.String()),
       summarize: Type.Optional(Type.Boolean()),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const forwarded: RollbackArgs = { ...params };
-      if (!forwarded.targetLabel && !forwarded.targetEntryId) {
-        const count = forwarded.count ?? 1;
-        const starts = checkpoints(ctx).filter((checkpoint) => /^rollback-before-\d+-0$/.test(checkpoint.label));
-        const target = starts.at(-count);
+      const forwarded: RollbackArgs = {};
+      if (params.targetLabel !== undefined) forwarded.targetLabel = params.targetLabel;
+      if (params.targetEntryId !== undefined) forwarded.targetEntryId = params.targetEntryId;
+      if (params.count !== undefined) forwarded.count = params.count;
+      if (params.turns !== undefined) forwarded.turnCount = params.turns;
+      if (params.runs !== undefined) forwarded.runCount = params.runs;
+      if (params.continuePrompt !== undefined) forwarded.continuePrompt = params.continuePrompt;
+      if (params.summarize !== undefined) forwarded.summarize = params.summarize;
+      if (
+        forwarded.count === undefined && forwarded.runCount === undefined && forwarded.turnCount === undefined
+        && !forwarded.targetLabel && !forwarded.targetEntryId
+      ) {
+        // Default target: the start of the current agent run (the common
+        // "undo everything this run did" case).
+        const starts = resolvedCheckpoints(ctx).filter((checkpoint) => isRunStartLabel(checkpoint.label));
+        const target = starts.at(-1);
         if (!target) throw new Error(`Can roll back at most ${starts.length} agent run(s)`);
-        forwarded.targetEntryId = target.entryId;
-        delete forwarded.count;
+        forwarded.targetEntryId = target.resolvedEntryId;
       }
       await pi.sendUserMessage(`/rollback ${JSON.stringify(forwarded)}`, { deliverAs: "followUp", expandPromptTemplates: true });
       return { content: [{ type: "text", text: "Queued rollback after the current turn." }], details: forwarded };

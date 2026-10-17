@@ -19,6 +19,7 @@ Checkpoints are saved automatically before and after every model turn, so undo t
 /rollback                              # without dialogs (print/json): one checkpoint back
 /rollback 3                            # three checkpoints back
 /rollback before the big refactor      # fuzzy label match (case-insensitive)
+/rollback turn 1                       # undo the last completed turn
 /rollback run 2                        # start of the run before last
 /rollback before refactor -- Try the smaller fix.
 /rollback entry:<session-entry-id>     # exact power-user form
@@ -33,7 +34,19 @@ Checkpoints are saved automatically before and after every model turn, so undo t
 
 Both bare `/rollback` and bare `/checkpoints` open the picker in TUI/RPC modes; `/checkpoints` asks for a one-key confirm before restoring, and Esc at any point falls back to (or just shows) the text listing. The picker and listing show each restore point as the message you sent at that moment, plus named checkpoints and `! before destructive command` guards; turn-level auto checkpoints are collapsed because they carry no human-readable meaning.
 
-Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number or `run <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`). The numeric target counts checkpoints, not whole agent runs.
+Label matching resolves in order: exact, case-insensitive exact, then unique substring. Ambiguous or unknown labels list candidates instead of guessing. A label that itself looks like a number, `run <n>`, or `turn <n>` can be targeted with the `label:` prefix (for example `/rollback label:run 2`).
+
+Target forms are explicit and do not shadow each other:
+
+| Form | Meaning |
+|---|---|
+| `<n>` / `count` | n checkpoints back |
+| `turn <n>` / `turns` | undo the last n **completed** turns (lands at the end of the turn before them) |
+| `run <n>` / `runs` | start of the n-th agent run back |
+| `<label>` | fuzzy match on a named checkpoint |
+| `entry:<id>` | exact session entry (power user) |
+
+Rolling back *to* a checkpoint navigates to the checkpoint entry itself, so the restore point stays selectable afterwards (it previously truncated its own record).
 
 `/checkpoints all` prints the raw turn-level list with relative timestamps and the exact command that restores each entry, including run boundaries. It shows every entry; `/checkpoints <n>` shows the last n (all four restore forms work on the full checkpoint list, not just the visible window):
 
@@ -44,7 +57,7 @@ Rollback checkpoints (oldest → newest):
   3. before the big refactor · 9m ago      (/rollback 2)
   4. run 2 turn 0 start · auto · 4m ago    (/rollback 1 · /rollback run 2)
   … 133 older hidden — /checkpoints <n> shows the last n, /checkpoints all shows every entry, /checkpoints <text> filters by label
-Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo
+Restore with: /rollback <label> · /rollback <n> · /rollback turn <n> · /rollback run <n> · /redo
 ```
 
 ### Agent tools and automatic guards
@@ -52,7 +65,9 @@ Restore with: /rollback <label> · /rollback <n> · /rollback run <n> · /redo
 Pi exposes two LLM-callable tools so agents participate in checkpointing instead of only reacting:
 
 - `checkpoint` — saves a named checkpoint mid-task. Agents are prompted to call it before risky or hard-to-reverse work (bulk edits, migrations, destructive shell commands) and at stable verified states.
-- `rollback` — queues a run-relative rollback (`count`, default 1) or restores an explicit checkpoint (`targetLabel`/`targetEntryId`). Its `count` addresses whole agent runs and is resolved to a stable `targetEntryId` before the follow-up command is queued.
+- `rollback` — queues a rollback. `turns: N` undoes the last N completed turns (the useful default for a failed repair), `runs: N` returns to the start of the Nth run back, `count: N` counts checkpoints back like `/rollback <n>`, and `targetLabel`/`targetEntryId` restore an explicit checkpoint. With no target it returns to the start of the current agent run. The tool queue semantics are unchanged: the command runs on the follow-up turn, so stop making changes after calling it.
+
+The model is also told what happened: a bounded `[pi-rollback]` context note reports the last rollback outcome for the turn that follows it (`Last rollback succeeded: restored N file(s) to checkpoint "…"`), lists named restore points once (and whenever the set changes) with how to save and restore them, and nudges when two consecutive edit attempts on the same file failed (`… consider undo_last_edit for the last change or rollback({turns:1}) instead of stacking another patch`). All notes are hidden in the UI, reset per session, and cost at most a few lines.
 
 Additionally, before a plausibly irreversible shell command (`rm`, `git reset --hard`, `git clean`, `git restore`, `find -delete`, `DROP TABLE`, `Remove-Item`, … — once per turn), the extension automatically flushes the journal, saves an `auto-before-destructive-*` checkpoint, and captures a workspace tree baseline. Bash-caused changes are otherwise unjournaled by default; the guard makes that damage revertible with `/rollback destructive`-style label matching even with deep tracking disabled. Set `PI_ROLLBACK_GUARD_DESTRUCTIVE=0` before starting Pi to disable it. Detection is conservative: harmless false positives only cost one checkpoint and snapshot.
 

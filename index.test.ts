@@ -9,6 +9,7 @@ import rollbackExtension, {
   buildRestoreMenu,
   capture as captureSnapshot,
   parseRollbackArgs,
+  fileEditFailureStreak,
   resolveLabelQuery,
   restore as restoreSnapshot,
   ROLLBACK_RESULT_EVENT,
@@ -67,6 +68,18 @@ afterEach(() => {
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
   testLayouts.clear();
 });
+test("parses turn/run/checkpoint targets in both human and JSON forms", () => {
+  assert.deepEqual(parseRollbackArgs("turn 1"), { turnCount: 1 });
+  assert.deepEqual(parseRollbackArgs("turns 3 -- retry"), { turnCount: 3, continuePrompt: "retry" });
+  assert.deepEqual(parseRollbackArgs("run 2"), { runCount: 2 });
+  assert.deepEqual(parseRollbackArgs("4"), { count: 4 });
+  assert.deepEqual(parseRollbackArgs('{"turnCount":1}'), { turnCount: 1 });
+  assert.deepEqual(parseRollbackArgs('{"runCount":2,"count":1}'), { runCount: 2, count: 1 });
+  assert.throws(() => parseRollbackArgs('{"turnCount":0}'), /turnCount must be a positive integer/);
+  // A label that looks like a target form stays reachable via the prefix.
+  assert.deepEqual(parseRollbackArgs("label:turn 1"), { labelQuery: "turn 1" });
+});
+
 test("parses human-friendly rollback commands and retains JSON compatibility", () => {
   assert.deepEqual(parseRollbackArgs("before-refactor"), { labelQuery: "before-refactor" });
   assert.deepEqual(parseRollbackArgs("before the big refactor"), { labelQuery: "before the big refactor" });
@@ -397,8 +410,11 @@ test("normal mode rollback and redo restore files plus the original checkpoint b
 
   await run.commands.rollback!("1", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "original\n");
-  assert.equal(run.navigatedTo(), "message-0");
-  assert.deepEqual(run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []), []);
+  // The rollback lands on the checkpoint entry itself, so the restore point it
+  // used stays available instead of truncating itself away.
+  const restorePoint = run.activeEntries().find((entry) => entry.customType === "pi-rollback-checkpoint" && entry.data?.label === "rollback-before-1-0");
+  assert.ok(restorePoint);
+  assert.equal(run.navigatedTo(), restorePoint.id);
 
   await run.commands.redo!("", run.ctx);
   assert.equal(readFileSync(file, "utf8"), "modified outside cwd\n");
@@ -439,10 +455,17 @@ test("projects the last rollback outcome and named restore points into context",
   assert.match(noteOf(third).content, /"before edits"/);
   assert.equal(readFileSync(file, "utf8"), "original\n");
 
-  // ... and the outcome line expires after that turn instead of lingering.
+  // The checkpoint itself survives the rollback (it is the navigation target).
+  assert.equal(run.activeEntries().some((entry) => entry.data?.label === "before edits"), true);
+
+  // ... and the outcome line expires after that turn instead of lingering, while
+  // the (still existing) named restore point stays announced.
   await run.handlers.turn_start!({ turnIndex: 2 }, run.ctx);
   const fourth = await run.handlers.context!({ messages: [] }, run.ctx);
-  assert.equal(noteOf(fourth), undefined);
+  const note4 = noteOf(fourth);
+  assert.ok(note4);
+  assert.doesNotMatch(note4.content, /Last rollback succeeded/);
+  assert.match(note4.content, /Named restore points/);
 });
 
 test("redo refuses to overwrite changes made after rollback", async () => {
@@ -583,6 +606,123 @@ test("path hints include quoted POSIX and Windows absolute arguments", () => {
   assert.ok(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work", "win32").includes(windowsPath));
   assert.equal(bashPathHints('Set-Content -Path "C:\\outside root\\demo.txt" -Value changed', "/work", "linux").includes(windowsPath), false);
 });
+test("rolling back to a named checkpoint keeps that restore point available", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-keep-checkpoint-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "a.txt");
+  writeFileSync(file, "v1\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("base", run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "v2\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("base", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "v1\n");
+  // The checkpoint is the navigation target, so it is not truncated away.
+  assert.equal(
+    run.activeEntries().some((entry) => entry.customType === "pi-rollback-checkpoint" && entry.data?.label === "base"),
+    true,
+  );
+
+  // A second rollback to the same label still resolves and succeeds.
+  await run.commands.rollback!("base", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "v1\n");
+  assert.equal(run.entries.filter((entry) => entry.customType === "pi-rollback-result").at(-1)!.data.ok, true);
+});
+
+test("turn target undoes the last N completed turns", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-turn-target-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "state.txt");
+  writeFileSync(file, "start\n");
+  const run = harness(cwd);
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "turn-0\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "turn-1\n");
+  await run.handlers.turn_end!({ turnIndex: 1 }, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 2 }, run.ctx);
+
+  // Undo only the last completed turn; the earlier turn's work stays. The JSON
+  // form is what the rollback tool forwards for turns=N.
+  await run.commands.rollback!('{"turnCount":1}', run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "turn-0\n");
+  const turnEnd = run.activeEntries().find(
+    (entry) => entry.customType === "pi-rollback-checkpoint" && entry.data?.label === "rollback-after-1-0",
+  );
+  assert.ok(turnEnd);
+  assert.equal(run.navigatedTo(), turnEnd.id);
+
+  // Asking for more turns than have completed fails loudly (the command handler
+  // reports through the UI) instead of guessing.
+  await run.commands.rollback!("turn 2", run.ctx);
+  assert.equal(run.notifications.some((message) => /Can roll back at most \d+ turn\(s\)/.test(message)), true);
+});
+
+test("fileEditFailureStreak flags only repeated failures on the same file", async () => {
+  const call = (id: string, toolName: string, args: Record<string, unknown>) => ({
+    type: "message",
+    id: `${id}-call`,
+    parentId: null,
+    message: { role: "assistant", content: [{ type: "toolCall", id, name: toolName, arguments: args }] },
+  });
+  const result = (id: string, toolName: string, isError: boolean) => ({
+    type: "message",
+    id: `${id}-result`,
+    parentId: null,
+    message: { role: "toolResult", toolCallId: id, toolName, isError, content: [] },
+  });
+
+  // Two consecutive failures on the same path.
+  assert.deepEqual(
+    fileEditFailureStreak([call("a", "edit", { path: "/x.ts" }), result("a", "edit", true)]),
+    undefined,
+    "one failure is not a streak",
+  );
+  assert.deepEqual(
+    fileEditFailureStreak([call("a", "edit", { path: "/x.ts" }), result("a", "edit", true), call("b", "edit", { path: "/x.ts" }), result("b", "edit", true)]),
+    { path: "/x.ts", failures: 2 },
+  );
+  // A success resets the streak; failures on other tools do not count.
+  assert.equal(
+    fileEditFailureStreak([call("a", "edit", { path: "/x.ts" }), result("a", "edit", true), call("b", "edit", { path: "/x.ts" }), result("b", "edit", false)]),
+    undefined,
+  );
+  assert.equal(
+    fileEditFailureStreak([call("a", "bash", {}), result("a", "bash", true), call("b", "bash", {}), result("b", "bash", true)]),
+    undefined,
+    "shell failures are not edit failures",
+  );
+  // Interleaved successes on another file still leave the streak to be detected.
+  assert.equal(
+    fileEditFailureStreak([
+      call("a", "write", { path: "/x.ts" }), result("a", "write", true),
+      call("b", "write", { path: "/y.ts" }), result("b", "write", false),
+      call("c", "write", { path: "/x.ts" }), result("c", "write", true),
+    ])?.path,
+    "/x.ts",
+  );
+  // ... and a success on the same file clears it, even when older failures for
+  // that file are still inside the window.
+  assert.equal(
+    fileEditFailureStreak([
+      call("a", "write", { path: "/x.ts" }), result("a", "write", true),
+      call("b", "write", { path: "/x.ts" }), result("b", "write", true),
+      call("c", "write", { path: "/x.ts" }), result("c", "write", false),
+    ]),
+    undefined,
+  );
+});
+
 test("run-count rollback crosses intervening automatic turn checkpoints and publishes a result", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-entry-"));
   cleanup.push(cwd, snapshotDir(cwd));
@@ -600,14 +740,16 @@ test("run-count rollback crosses intervening automatic turn checkpoints and publ
 
   await run.commands.rollback!('{"runCount":1,"requestId":"supervisor-request-1"}', run.ctx);
   assert.equal(readFileSync(file, "utf8"), "original\n");
-  assert.equal(run.navigatedTo(), "message-0");
+  const runStart = run.activeEntries().find((entry) => entry.customType === "pi-rollback-checkpoint" && entry.data?.label === "rollback-before-1-0");
+  assert.ok(runStart);
+  assert.equal(run.navigatedTo(), runStart.id);
   assert.equal(run.emitted.length, 1);
   assert.equal(run.emitted[0]!.event, ROLLBACK_RESULT_EVENT);
   assert.deepEqual(run.emitted[0]!.data, {
     version: 1,
     requestId: "supervisor-request-1",
     ok: true,
-    targetEntryId: "message-0",
+    targetEntryId: runStart.id,
     targetLabel: "rollback-before-1-0",
     files: 1,
     createdAt: (run.emitted[0]!.data as { createdAt: number }).createdAt,
@@ -640,21 +782,36 @@ test("continuation queue failure does not publish a contradictory rollback failu
   assert.match(run.notifications.join("\n"), /continuation could not be queued/);
 });
 
-test("LLM rollback tool dispatches the extension command on the follow-up turn", async () => {
+test("LLM rollback tool forwards turn/run/checkpoint targets and defaults to the current run", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-tool-"));
   cleanup.push(cwd);
   const run = harness(cwd);
   await run.handlers.agent_start!({}, run.ctx);
   await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
-  await run.toolDefs.rollback.execute("tool-1", { count: 1, summarize: true }, undefined, undefined, run.ctx);
-  assert.deepEqual(run.sentMessages, [{
-    content: '/rollback {"summarize":true,"targetEntryId":"message-0"}',
-    options: { deliverAs: "followUp", expandPromptTemplates: true },
-  }]);
-  assert.match(run.toolDefs.rollback.promptSnippet, /conversation and journaled workspace files/);
-  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /count is run-relative/);
-  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /proactively roll back without waiting for the user/);
-  assert.match(run.toolDefs.rollback.promptGuidelines.join("\n"), /isolated mistake with a clear local fix/);
+  const execute = (params: any) => run.toolDefs.rollback.execute("tool-1", params, undefined, undefined, run.ctx);
+  const sent = () => run.sentMessages.at(-1)!.content;
+
+  await execute({ turns: 1, summarize: true });
+  assert.equal(sent(), '/rollback {"turnCount":1,"summarize":true}');
+
+  await execute({ runs: 2 });
+  assert.equal(sent(), '/rollback {"runCount":2}');
+
+  // count keeps the /rollback <n> meaning: checkpoints back.
+  await execute({ count: 3 });
+  assert.equal(sent(), '/rollback {"count":3}');
+
+  // No target: the start of the current run, resolved to a stable entry id.
+  await execute({});
+  assert.equal(sent(), '/rollback {"targetEntryId":"custom-1"}');
+
+  const guidelines = run.toolDefs.rollback.promptGuidelines.join("\n");
+  assert.match(run.toolDefs.rollback.promptSnippet, /earlier turn, run, or checkpoint/);
+  assert.match(guidelines, /turns=N undoes the last N completed turns/);
+  assert.match(guidelines, /count=N counts checkpoints back/);
+  assert.match(guidelines, /Roll back proactively, without waiting for the user/);
+  assert.match(guidelines, /two consecutive attempts to change the same file both fail/);
+  assert.match(guidelines, /isolated mistake with a clear local fix/);
 });
 
 test("registers mutation hooks and commands", () => {
