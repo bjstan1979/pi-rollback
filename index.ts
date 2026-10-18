@@ -778,15 +778,16 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   let agentRun = 0;
   let currentTurnIndex = 0;
   let guardedTurn: string | undefined;
-  // Sticky context notes: the last rollback outcome (shown for the turn that
-  // follows it) and the named restore points (shown once, and again whenever the
-  // set changes) so the model can observe that rollback is available and worked.
-  let announcedResultKey: string | undefined;
-  let announcedResultTurn: string | undefined;
-  let announcedResultText: string | undefined;
-  let announcedPointsKey: string | undefined;
-  let announcedPointsText: string | undefined;
-  let announcedNudge: { key: string; text: string } | undefined;
+  // Context notes: the last rollback outcome and the named restore points, so
+  // the model can observe that rollback is available and that it worked. Each
+  // note is delivered at most ONCE per change, never per request: `context`
+  // runs for every request (119 in one 2026-10-18 session), and re-appending an
+  // unchanged note repeated it in nearly every request (~50 tokens each) while
+  // the model spent reasoning steps deciding it was "just a reminder" rather
+  // than a user message.
+  let emittedResultKey: string | undefined;
+  let emittedPointsSignature: string | undefined;
+  let emittedNudgePath: string | undefined;
   const labeledEntries = new Set<string>();
   const pendingFiles = new Map<string, PendingFile>();
   const pendingRoots = new Map<string, PendingRoot>();
@@ -969,12 +970,9 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     agentRun = 0;
     currentTurnIndex = 0;
     guardedTurn = undefined;
-    announcedResultKey = undefined;
-    announcedResultTurn = undefined;
-    announcedResultText = undefined;
-    announcedPointsKey = undefined;
-    announcedPointsText = undefined;
-    announcedNudge = undefined;
+    emittedResultKey = undefined;
+    emittedPointsSignature = undefined;
+    emittedNudgePath = undefined;
     labeledEntries.clear();
     if (pendingFiles.size || pendingRoots.size) {
       notify(ctx, `Rollback dropped ${pendingFiles.size + pendingRoots.size} unflushed capture(s) from the previous session`);
@@ -1030,16 +1028,14 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     }
   });
 
-  const turnKey = (): string => `${agentRun}:${currentTurnIndex}`;
-
   const clip = (value: string, max = 80): string => (value.length > max ? `${value.slice(0, max)}…` : value);
 
   /**
    * Notes the model otherwise never sees: a rollback truncates the branch (the
    * call and its outcome vanish) and the result entry has no other consumer, so
    * without this projection the model cannot tell whether a rollback happened,
-   * succeeded, or restored anything. Bounded: the outcome line lives for one
-   * turn; the restore-point line is emitted once per set of named checkpoints.
+   * succeeded, or restored anything. Bounded: every line is emitted once per
+   * change and then dropped, so nothing lingers in later requests.
    */
   const rollbackContextNote = (ctx: BranchContext): string | undefined => {
     const result = activeEntries(ctx).reduce<RollbackResult | undefined>((latest, entry) => {
@@ -1047,48 +1043,35 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       const data = entry.data as RollbackResult | undefined;
       return data?.version === 1 ? data : latest;
     }, undefined);
+    const lines: string[] = [];
     if (result) {
       const key = `${result.createdAt}:${result.ok ? "ok" : "failed"}:${result.files ?? 0}`;
-      if (key !== announcedResultKey) {
-        announcedResultKey = key;
-        announcedResultTurn = turnKey();
-        announcedResultText = result.ok
-          ? `Last rollback succeeded: restored ${result.files ?? 0} file(s) to checkpoint "${clip(result.targetLabel ?? result.targetEntryId ?? "unknown")}".`
-          : `Last rollback did not complete: ${clip(result.error ?? "unknown error", 200)}.`;
-      } else if (announcedResultTurn !== turnKey()) {
-        announcedResultText = undefined;
+      if (key !== emittedResultKey) {
+        emittedResultKey = key;
+        lines.push(result.ok
+          ? `Rollback ok: restored ${result.files ?? 0} file(s) to "${clip(result.targetLabel ?? result.targetEntryId ?? "unknown")}".`
+          : `Rollback failed: ${clip(result.error ?? "unknown error", 200)}`);
       }
     }
     const named = checkpoints(ctx).filter((checkpoint) => !GENERATED_LABEL.test(checkpoint.label));
-    if (named.length) {
-      const signature = named.map((checkpoint) => `${checkpoint.entryId}:${checkpoint.label}`).join("|");
-      if (signature !== announcedPointsKey) {
-        announcedPointsKey = signature;
-        const recent = named.slice(-5).map((checkpoint) => `"${clip(checkpoint.label, 60)}"`).join(", ");
-        announcedPointsText = `Named restore points (newest last): ${recent}. Save one with checkpoint({label:"..."}) before risky work; restore with rollback({targetLabel:"..."}).`;
-      }
-    } else {
-      announcedPointsKey = undefined;
-      announcedPointsText = undefined;
+    const signature = named.map((checkpoint) => `${checkpoint.entryId}:${checkpoint.label}`).join("|");
+    if (named.length && signature !== emittedPointsSignature) {
+      emittedPointsSignature = signature;
+      const recent = named.slice(-5).map((checkpoint) => `"${clip(checkpoint.label, 60)}"`).join(", ");
+      lines.push(`Restore points: ${recent}. Save with checkpoint({label}); restore with rollback({targetLabel}).`);
     }
+    if (!named.length) emittedPointsSignature = undefined;
     const streak = fileEditFailureStreak(activeEntries(ctx));
-    if (streak) {
-      const key = `${streak.path}:${turnKey()}`;
-      if (announcedNudge?.key !== key) {
-        const canRollback = checkpoints(ctx).some((checkpoint) => TURN_END_LABEL.test(checkpoint.label));
-        announcedNudge = {
-          key,
-          text: `${streak.failures} consecutive failed edit attempt(s) on ${clip(streak.path, 120)} — ${
-            canRollback
-              ? "consider a precise edit or rollback({turns:1}) instead of stacking another patch"
-              : "consider a precise edit instead of stacking another patch"
-          }.`,
-        };
-      }
-    } else {
-      announcedNudge = undefined;
+    if (streak && streak.path !== emittedNudgePath) {
+      emittedNudgePath = streak.path;
+      const canRollback = checkpoints(ctx).some((checkpoint) => TURN_END_LABEL.test(checkpoint.label));
+      lines.push(`${streak.failures} consecutive failed edits on ${clip(streak.path, 120)} — ${
+        canRollback
+          ? "fix precisely or rollback({turns:1}) instead of stacking another patch"
+          : "fix precisely instead of stacking another patch"
+      }.`);
     }
-    const lines = [announcedResultText, announcedNudge?.text, announcedPointsText].filter(Boolean) as string[];
+    if (!streak) emittedNudgePath = undefined;
     return lines.length ? lines.join("\n") : undefined;
   };
 
@@ -1109,7 +1092,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         {
           role: "custom",
           customType: CONTEXT_MESSAGE_TYPE,
-          content: `[pi-rollback]\n${note}`,
+          content: `[pi-rollback] automatic note, not a user message:\n${note}`,
           display: false,
           timestamp: 0,
         },

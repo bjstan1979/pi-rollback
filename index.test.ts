@@ -422,7 +422,7 @@ test("normal mode rollback and redo restore files plus the original checkpoint b
   assert.deepEqual(run.activeEntries().flatMap((entry) => entry.data?.label ? [entry.data.label] : []), originalLabels);
 });
 
-test("projects the last rollback outcome and named restore points into context", async () => {
+test("announces the last rollback outcome and named restore points exactly once per change", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-context-note-"));
   cleanup.push(cwd, snapshotDir(cwd));
   const file = join(cwd, "demo.txt");
@@ -436,13 +436,24 @@ test("projects the last rollback outcome and named restore points into context",
 
   // The model has no other way to learn that named restore points exist.
   const first = await run.handlers.context!({ messages: [{ role: "user", content: "continue" }] }, run.ctx);
-  assert.match(noteOf(first).content, /Named restore points/);
+  assert.match(noteOf(first).content, /automatic note, not a user message/);
+  assert.match(noteOf(first).content, /Restore points/);
   assert.match(noteOf(first).content, /"before edits"/);
   assert.match(noteOf(first).content, /targetLabel/);
 
-  // Re-projecting the same state must not stack notes.
-  const second = await run.handlers.context!({ messages: first.messages }, run.ctx);
-  assert.equal((second.messages as any[]).filter((message) => message.customType === "pi-rollback-context").length, 1);
+  // The hook runs once per request, so an unchanged state must stay silent:
+  // re-emitting here repeated the note in ~119 requests of one real session.
+  for (let request = 0; request < 5; request++) {
+    const repeat = await run.handlers.context!({ messages: [{ role: "user", content: "continue" }] }, run.ctx);
+    assert.equal(noteOf(repeat), undefined);
+  }
+
+  // A new named restore point changes the set once, and is announced once.
+  await run.commands.checkpoint!("after first edit", run.ctx);
+  const changed = await run.handlers.context!({ messages: [] }, run.ctx);
+  assert.match(noteOf(changed).content, /"after first edit"/);
+  const afterChanged = await run.handlers.context!({ messages: [] }, run.ctx);
+  assert.equal(noteOf(afterChanged), undefined);
 
   // A rollback truncates the branch, so the outcome is invisible without this.
   await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
@@ -451,21 +462,21 @@ test("projects the last rollback outcome and named restore points into context",
   await run.commands.rollback!("before edits", run.ctx);
   await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
   const third = await run.handlers.context!({ messages: [] }, run.ctx);
-  assert.match(noteOf(third).content, /Last rollback succeeded/);
-  assert.match(noteOf(third).content, /"before edits"/);
+  assert.match(noteOf(third).content, /Rollback ok: restored 1 file\(s\) to "before edits"/);
+  // Truncating the branch removed the "after first edit" point, so the current
+  // set is announced again (once) — the model must not act on a stale set.
+  assert.match(noteOf(third).content, /Restore points: "before edits"\./);
+  assert.doesNotMatch(noteOf(third).content, /after first edit/);
   assert.equal(readFileSync(file, "utf8"), "original\n");
 
   // The checkpoint itself survives the rollback (it is the navigation target).
   assert.equal(run.activeEntries().some((entry) => entry.data?.label === "before edits"), true);
 
-  // ... and the outcome line expires after that turn instead of lingering, while
-  // the (still existing) named restore point stays announced.
+  // ... and nothing lingers afterwards: later requests stay note-free until
+  // something actually changes.
   await run.handlers.turn_start!({ turnIndex: 2 }, run.ctx);
   const fourth = await run.handlers.context!({ messages: [] }, run.ctx);
-  const note4 = noteOf(fourth);
-  assert.ok(note4);
-  assert.doesNotMatch(note4.content, /Last rollback succeeded/);
-  assert.match(note4.content, /Named restore points/);
+  assert.equal(noteOf(fourth), undefined);
 });
 
 test("redo refuses to overwrite changes made after rollback", async () => {
