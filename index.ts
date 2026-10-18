@@ -317,7 +317,7 @@ function activeRedo(ctx: BranchContext): ActiveRedo | undefined {
   return entry ? { entryId: entry.id, data: entry.data as RedoRecord } : undefined;
 }
 
-const MUTATION_TOOL_NAMES = new Set(["write", "edit", "undo_last_edit", "ts_morph"]);
+const MUTATION_TOOL_NAMES = new Set(["write", "edit", "ts_morph"]);
 
 /** Walk back from a tool result to the assistant call that produced it. */
 function findToolCall(
@@ -349,7 +349,7 @@ function toolResultFailed(message: NonNullable<SessionEntry["message"]>): boolea
 /**
  * Detect repeated failed file mutations: two consecutive failed attempts on the
  * same path (a successful mutation resets that path's streak). Used to nudge the
- * model toward undo_last_edit/rollback instead of stacking another patch.
+ * model toward a precise edit or rollback instead of stacking another patch.
  */
 export function fileEditFailureStreak(
   entries: readonly SessionEntry[],
@@ -1080,8 +1080,8 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
           key,
           text: `${streak.failures} consecutive failed edit attempt(s) on ${clip(streak.path, 120)} — ${
             canRollback
-              ? "consider undo_last_edit for the last change or rollback({turns:1}) instead of stacking another patch"
-              : "consider undo_last_edit for the last change instead of stacking another patch"
+              ? "consider a precise edit or rollback({turns:1}) instead of stacking another patch"
+              : "consider a precise edit instead of stacking another patch"
           }.`,
         };
       }
@@ -1447,7 +1447,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       "Call checkpoint with a short label before risky or hard-to-reverse work (bulk edits, migrations, destructive shell commands); it is cheap and makes an exact restore possible later. Automatic checkpoints already bracket every turn, and destructive shell commands are auto-guarded (label prefix auto-before-destructive).",
       "rollback targets: turns=N undoes the last N completed turns (the useful default for a failed repair), runs=N returns to the start of the Nth agent run back, count=N counts checkpoints back like /rollback <n>, and targetLabel/targetEntryId restore an explicit checkpoint. With no target it returns to the start of the current run. The rollback is queued after the current turn, so stop making changes after calling it.",
       "Roll back proactively, without waiting for the user, when the same failure repeats, when two consecutive attempts to change the same file both fail, when fixes start spreading across files or overwriting earlier work, or when the evidence shows the approach is wrong. Prefer rollback over stacking another speculative patch.",
-      "For an isolated mistake with a clear local fix, use edit or undo_last_edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or an explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback (opens an interactive picker; direct forms <label> | <n> | run <n> | turn <n> [-- <continue prompt>]), and /redo.",
+      "For an isolated mistake with a clear local fix, use edit instead. Before rolling back proactively, avoid discarding validated work from the current run; use a precise edit or an explicit checkpoint when only part of the run is wrong. Slash commands available to the user are /checkpoint <label>, /checkpoints, /rollback (opens an interactive picker; direct forms <label> | <n> | run <n> | turn <n> [-- <continue prompt>]), and /redo.",
     ],
     parameters: Type.Object({
       targetLabel: Type.Optional(Type.String({ description: "Exact or fuzzy label of a named checkpoint." })),

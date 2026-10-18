@@ -102,7 +102,7 @@ export function restoreFileState(path: string, state: FileState, blobRoot = BLOB
 export function mutationPaths(toolName: string, input: unknown, cwd: string, sandboxed: boolean): string[] {
   const value = input && typeof input === "object" ? input as Record<string, unknown> : {};
   let candidate: unknown;
-  if (toolName === "write" || toolName === "edit" || toolName === "undo_last_edit") candidate = value.path;
+  if (toolName === "write" || toolName === "edit") candidate = value.path;
   else if (toolName === "ts_morph") candidate = value.filePath;
   if (typeof candidate !== "string" || !candidate.trim()) return [];
   const path = canonicalMutationPath(candidate, cwd);
