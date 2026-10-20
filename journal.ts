@@ -28,13 +28,36 @@ function storeBlob(content: Buffer, blobRoot: string): string {
   const path = blobPath(blob, blobRoot);
   if (!existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    // Write-then-rename: a crash or full disk mid-write must never leave a
+    // truncated blob at the final path. The existence check above would treat
+    // it as already stored and every later restore of that state would fail
+    // with "Corrupt rollback blob".
+    const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
     try {
-      writeFileSync(path, content, { flag: "wx", mode: 0o600 });
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, path);
+    } finally {
+      if (existsSync(temporary)) rmSync(temporary, { force: true });
     }
   }
   return blob;
+}
+
+/**
+ * Stat-keyed memo of the last hashed state per path. captureFileState runs for
+ * every journaled file at every turn boundary (external-change reconciliation),
+ * so without it each turn re-reads and re-hashes every tracked file. An entry is
+ * trusted only when device, inode, size, mode, mtime and ctime all match and the
+ * file was not modified within RACY_WINDOW_MS of the hash (the same "racy clean"
+ * rule Git applies to its index), so same-second rewrites are always re-hashed.
+ */
+interface StatMemo { dev: number; ino: number; size: number; mode: number; mtimeMs: number; ctimeMs: number; hashedAt: number; blob: string }
+const statMemo = new Map<string, StatMemo>();
+const STAT_MEMO_LIMIT = 4096;
+const RACY_WINDOW_MS = 2_000;
+
+export function clearFileStateCache(): void {
+  statMemo.clear();
 }
 
 /** Resolve existing symlinks so a write through cwd/link tracks the actual target. */
@@ -65,7 +88,23 @@ export function captureFileState(path: string, blobRoot = BLOB_ROOT): FileState 
   if (!existsSync(path)) return { kind: "missing" };
   const stat = lstatSync(path);
   if (!stat.isFile()) throw new Error(`Rollback supports regular files only: ${path}`);
-  return { kind: "file", blob: storeBlob(readFileSync(path), blobRoot), mode: stat.mode & 0o777 };
+  const mode = stat.mode & 0o777;
+  const key = `${blobRoot}\0${path}`;
+  const memo = statMemo.get(key);
+  if (
+    memo
+    && memo.dev === stat.dev && memo.ino === stat.ino && memo.size === stat.size && memo.mode === mode
+    && memo.mtimeMs === stat.mtimeMs && memo.ctimeMs === stat.ctimeMs
+    && memo.hashedAt - stat.mtimeMs > RACY_WINDOW_MS
+    && existsSync(blobPath(memo.blob, blobRoot))
+  ) {
+    return { kind: "file", blob: memo.blob, mode };
+  }
+  const hashedAt = Date.now();
+  const blob = storeBlob(readFileSync(path), blobRoot);
+  if (statMemo.size >= STAT_MEMO_LIMIT) statMemo.clear();
+  statMemo.set(key, { dev: stat.dev, ino: stat.ino, size: stat.size, mode, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, hashedAt, blob });
+  return { kind: "file", blob, mode };
 }
 
 export function sameFileState(a: FileState, b: FileState): boolean {
@@ -117,21 +156,36 @@ export function mutationPaths(toolName: string, input: unknown, cwd: string, san
  * enough to guard.
  */
 export function isDestructiveCommand(command: string): boolean {
-  return /(?:^|[\s;&|(=])(?:rm|rmdir|shred|unlink)(?:\s|$)|\bfind\b[^\n]*\s-delete(?:\s|$)|\bxargs\b[^\n]*\s(?:rm|rmdir)\b|git\s+(?:reset\s+--hard|clean\b|checkout\s+(?:--|\.)|restore\b|switch\s+--force|branch\s+-D\b)|(?:^|[\s;&|(])\bdd\b[^\n]*\bof=|\b(?:mkfs(?:\.\w+)?|wipefs)\b|\b(?:DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE\s+TABLE|DELETE\s+FROM)\b|\bremove-item\b/i.test(command);
+  return /(?:^|[\s;&|(=`/])(?:rm|rmdir|shred|unlink)(?:\s|$)|(?:^|[\s;&|(])(?:del|erase|rd)\s+\S|\btruncate\s+(?:-s|--size)\b|\bfind\b[^\n]*\s-delete(?:\s|$)|\bxargs\b[^\n]*\s(?:rm|rmdir)\b|git\s+(?:reset\s+--hard|clean\b|checkout\s+(?:--|\.)|restore\b|switch\s+--force|branch\s+-D\b)|(?:^|[\s;&|(])\bdd\b[^\n]*\bof=|\b(?:mkfs(?:\.\w+)?|wipefs)\b|\b(?:DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE\s+TABLE|DELETE\s+FROM)\b|\bremove-item\b/i.test(command);
+}
+
+/**
+ * POSIX locations that are never workspace roots: pseudo filesystems (a Git
+ * snapshot of /dev or /proc hangs or fails) and system binary directories.
+ * `> /dev/null` alone otherwise turned /dev into a deep-tracking snapshot root.
+ */
+const NON_WORKSPACE_PREFIXES = ["/dev/", "/proc/", "/sys/", "/run/", "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/"];
+
+export function isNonWorkspacePath(path: string): boolean {
+  const normalized = path.endsWith("/") ? path : `${path}/`;
+  return NON_WORKSPACE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 /** Conservative hints only; arbitrary shell side effects cannot be inferred statically. */
 export function bashPathHints(command: string, cwd: string, platform: string = process.platform): string[] {
   const hints = new Set<string>();
   const add = (raw: string): void => {
-    const value = raw.replace(/^['"]|['"]$/g, "");
-    if (!value) return;
+    let value = raw.replace(/^['"]|['"]$/g, "");
+    if (!value || value === "-") return;
+    const home = platform === "win32" ? process.env.USERPROFILE : process.env.HOME;
+    // `cd ~/x` is expanded by the shell; resolving it literally produced <cwd>/~/x.
+    if (platform !== "win32" && home && (value === "~" || value.startsWith("~/"))) value = home + value.slice(1);
+    else if (value.startsWith("~")) return;
     const windows = platform === "win32" && !value.startsWith("/") && win32.isAbsolute(value);
     const path = windows ? win32.normalize(value) : resolve(cwd, value);
     const root = windows ? win32.parse(path).root : "/";
-    const home = windows ? process.env.USERPROFILE : process.env.HOME;
     if (path.toLowerCase() === root.toLowerCase() || (home && path.toLowerCase() === home.toLowerCase())) return;
-    if (!windows && ["/usr/bin/", "/bin/", "/sbin/"].some((prefix) => path.startsWith(prefix))) return;
+    if (!windows && isNonWorkspacePath(path)) return;
     hints.add(path);
   };
   for (const match of command.matchAll(/(?:^|[;&|]\s*|\s)cd\s+(?:--\s+)?((?:'[^']+'|"[^"]+"|[^\s;&|]+))/g)) add(match[1]!);

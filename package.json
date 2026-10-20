@@ -1,6 +1,6 @@
 {
   "name": "pi-rollback",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Branch-aware conversation and workspace rollback for Pi",
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,8 @@
   },
   "scripts": {
     "test": "bun test index.test.ts prune.test.ts",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "test:runtime": "node --test runtime.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

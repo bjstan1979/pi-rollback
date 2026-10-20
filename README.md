@@ -41,7 +41,7 @@ Target forms are explicit and do not shadow each other:
 | Form | Meaning |
 |---|---|
 | `<n>` / `count` | n checkpoints back |
-| `turn <n>` / `turns` | undo the last n **completed** turns (lands at the end of the turn before them) |
+| `turn <n>` / `turns` | undo the last n **completed** turns (lands at the end of the turn before them, or at the run start when that includes the first turn) |
 | `run <n>` / `runs` | start of the n-th agent run back |
 | `<label>` | fuzzy match on a named checkpoint |
 | `entry:<id>` | exact session entry (power user) |
@@ -65,11 +65,11 @@ Restore with: /rollback <label> · /rollback <n> · /rollback turn <n> · /rollb
 Pi exposes two LLM-callable tools so agents participate in checkpointing instead of only reacting:
 
 - `checkpoint` — saves a named checkpoint mid-task. Agents are prompted to call it before risky or hard-to-reverse work (bulk edits, migrations, destructive shell commands) and at stable verified states.
-- `rollback` — queues a rollback. `turns: N` undoes the last N completed turns (the useful default for a failed repair), `runs: N` returns to the start of the Nth run back, `count: N` counts checkpoints back like `/rollback <n>`, and `targetLabel`/`targetEntryId` restore an explicit checkpoint. With no target it returns to the start of the current agent run. The tool queue semantics are unchanged: the command runs on the follow-up turn, so stop making changes after calling it.
+- `rollback` — queues a rollback. `turns: N` undoes the last N completed turns (the useful default for a failed repair), `runs: N` returns to the start of the Nth run back, `count: N` counts checkpoints back like `/rollback <n>`, and `targetLabel` (exact or fuzzy, same matching as `/rollback <label>`) / `targetEntryId` restore an explicit checkpoint. With no target it returns to the start of the current agent run. The target is resolved **when the tool is called** and queued as an exact entry, so turns that end before the queued command runs cannot shift it; everything after the target, including the calling turn, is discarded. The command runs on the follow-up turn, so stop making changes after calling it.
 
 The model is also told what happened: a `[pi-rollback]` context note reports the last rollback outcome (`Rollback ok: restored N file(s) to "…"`), lists named restore points with how to save and restore them, and nudges when two consecutive edit attempts on the same file failed (`… fix precisely or rollback({turns:1}) instead of stacking another patch`). Each line is delivered **once per change** — never once per request — because the `context` hook runs for every request: re-appending an unchanged note repeated it in ~136 requests of one real session, where the model then spent 42 reasoning blocks deciding whether it was user input (~9.7k reasoning tokens). Notes are prefixed `automatic note, not a user message`, hidden in the UI, and reset per session.
 
-Additionally, before a plausibly irreversible shell command (`rm`, `git reset --hard`, `git clean`, `git restore`, `find -delete`, `DROP TABLE`, `Remove-Item`, … — once per turn), the extension automatically flushes the journal, saves an `auto-before-destructive-*` checkpoint, and captures a workspace tree baseline. Bash-caused changes are otherwise unjournaled by default; the guard makes that damage revertible with `/rollback destructive`-style label matching even with deep tracking disabled. Set `PI_ROLLBACK_GUARD_DESTRUCTIVE=0` before starting Pi to disable it. Detection is conservative: harmless false positives only cost one checkpoint and snapshot.
+Additionally, before a plausibly irreversible shell command (`rm`, `git reset --hard`, `git clean`, `git restore`, `find -delete`, `DROP TABLE`, `Remove-Item`, … — once per turn), the extension automatically flushes the journal, saves an `auto-before-destructive-*` checkpoint, and captures a workspace tree baseline. Bash-caused changes are otherwise unjournaled by default; the guard makes that damage revertible with `/rollback destructive`-style label matching even with deep tracking disabled. Set `PI_ROLLBACK_GUARD_DESTRUCTIVE=0` before starting Pi to disable it. When Pi runs directly in `/` or your home directory, the guard still saves the conversation checkpoint but skips the workspace tree baseline (a whole-home snapshot would time out). Detection is conservative: harmless false positives only cost one checkpoint and snapshot.
 
 ### Extension integration
 
@@ -94,7 +94,7 @@ Rollback never deletes later checkpoints; they remain on the original inactive b
 - `write`, `edit`, and `ts_morph` are journaled by their actual canonical file path, including paths outside Pi's cwd.
 - File contents are deduplicated in `~/.pi/agent/rollback-snapshots/blobs/`.
 - Bash/PowerShell full-tree snapshots are disabled by default so turn submission never blocks on large or historical roots; plausibly destructive commands are still guarded per turn (see above).
-- Set `PI_ROLLBACK_DEEP_TRACKING=1` before starting Pi to opt into shell snapshots for cwd and roots inferred from the current command, plus next-turn checks for directly journaled files. Historical shell roots are never rescanned at turn boundaries.
+- Set `PI_ROLLBACK_DEEP_TRACKING=1` before starting Pi to opt into shell snapshots for cwd and roots inferred from the current command, plus next-turn checks for directly journaled files. Historical shell roots are never rescanned at turn boundaries. Inferred roots never include `/`, your home directory or its ancestors, or pseudo/system paths (`/dev`, `/proc`, `/sys`, `/run`, `/bin`, …), so `> /dev/null` no longer turns `/dev` into a snapshot root.
 
 ### HCOM sandbox
 
@@ -169,3 +169,20 @@ the journal with the actual disk first, so checkpoint targets reflect reality
 and out-of-band edits are preserved unless they post-date the chosen
 checkpoint. `PI_ROLLBACK_DEEP_TRACKING` continues to gate only bash/powershell
 root-tree tracking, which it was always meant to gate.
+
+## Fixes in 0.6.2
+
+- **Tree restore across file↔directory changes.** Restoring a snapshot where a path changed between file and directory failed and could not recover (`AggregateError`). Restore now deletes paths that exist only in the current tree first, then checks out the rest in batches from one `git diff --name-status` (previously two Git processes per changed file).
+- **Glob-like file names.** Snapshot checkouts use `--literal-pathspecs`; names containing `*`, `?`, `[` or a leading `:` were interpreted as pathspec patterns.
+- **Rollback tool target drift.** `turns`/`count`/`runs`/`targetLabel` are resolved when the tool is called. Previously they were re-resolved after the agent settled, so `turns: 1` usually undid only the final text-only reply turn.
+- **Fuzzy `targetLabel` in the tool** now works as documented (it previously required an exact label).
+- **`/rollback turn <n>` covering the first turn** lands at the preceding run start instead of being refused.
+- **Resumed sessions** continue run numbering from existing checkpoints instead of restarting at 1 (duplicate `rollback-before-1-0` labels, wrong "current run" marker), and do not replay an old rollback outcome as a new context note.
+- **`/checkpoints <text>`** filters the full restore history, not only the newest 20 entries.
+- **Picker duplicates.** Identical rows (e.g. several runs started with "continue") are numbered so selecting one restores that exact point.
+- **Blob writes are atomic** (temp file + rename). A crash mid-write could previously leave a truncated blob that was treated as stored, breaking every later restore of that state.
+- **Turn-boundary hashing is memoized by file stat** (dev/inode/size/mode/mtime/ctime, with a racy-write window), so unchanged journaled files are no longer re-read every turn.
+- **Rollback ordering.** Request validation runs before any side effect, and external-change reconciliation no longer runs before `waitForIdle()` (it could record in-flight tool writes as external changes). Failure results report the checkpoint entry id like success results.
+- **Hook robustness.** Lease errors in `tool_call`, `/rollback`, `/redo` and `/checkpoint` become warnings instead of escaping the handler. `/checkpoint` asks for its label before flushing the journal.
+- Deep-tracking path hints expand `~/…` and ignore `cd -`; the destructive guard also recognizes `/bin/rm`, `` `rm` ``, `del`/`erase`/`rd` and `truncate -s`.
+- Minor: per-request context note reads the branch once; referenced-store scan is memoized; `/checkpoints all` listing is linear instead of quadratic.

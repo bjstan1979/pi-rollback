@@ -1,7 +1,7 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -357,7 +357,7 @@ test("restore never deletes files when Git cannot inspect the target tree", asyn
   writeFileSync(file, "current\n");
   const pi = {
     async exec(command: string, args: string[], options?: { cwd?: string }) {
-      if (args.includes("ls-tree")) return { stdout: "", stderr: "repository I/O failure", code: 128, killed: false };
+      if (args.includes("diff")) return { stdout: "", stderr: "repository I/O failure", code: 128, killed: false };
       return exec(command, args, options);
     },
   } as ExtensionAPI;
@@ -379,7 +379,9 @@ test("restore reverses files already changed when a later checkout fails", async
   let checkouts = 0;
   const pi = {
     async exec(command: string, args: string[], options?: { cwd?: string }) {
-      if (args.includes("checkout") && ++checkouts === 2) {
+      if (args.includes("checkout") && ++checkouts === 1) {
+        // Simulate Git changing part of a batch before returning an error.
+        writeFileSync(first, "target\n");
         return { stdout: "", stderr: "injected checkout failure", code: 1, killed: false };
       }
       return exec(command, args, options);
@@ -793,7 +795,7 @@ test("continuation queue failure does not publish a contradictory rollback failu
   assert.match(run.notifications.join("\n"), /continuation could not be queued/);
 });
 
-test("LLM rollback tool forwards turn/run/checkpoint targets and defaults to the current run", async () => {
+test("LLM rollback tool freezes turn/run/checkpoint targets and defaults to the current run", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-tool-"));
   cleanup.push(cwd);
   const run = harness(cwd);
@@ -802,15 +804,16 @@ test("LLM rollback tool forwards turn/run/checkpoint targets and defaults to the
   const execute = (params: any) => run.toolDefs.rollback.execute("tool-1", params, undefined, undefined, run.ctx);
   const sent = () => run.sentMessages.at(-1)!.content;
 
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
   await execute({ turns: 1, summarize: true });
-  assert.equal(sent(), '/rollback {"turnCount":1,"summarize":true}');
+  assert.deepEqual(JSON.parse(sent().slice("/rollback ".length)), { targetEntryId: "custom-1", summarize: true });
 
-  await execute({ runs: 2 });
-  assert.equal(sent(), '/rollback {"runCount":2}');
+  await execute({ runs: 1 });
+  assert.equal(sent(), '/rollback {"targetEntryId":"custom-1"}');
 
-  // count keeps the /rollback <n> meaning: checkpoints back.
-  await execute({ count: 3 });
-  assert.equal(sent(), '/rollback {"count":3}');
+  // All relative targets are frozen before the follow-up turn runs.
+  await execute({ count: 1 });
+  assert.equal(sent(), '/rollback {"targetEntryId":"custom-1"}');
 
   // No target: the start of the current run, resolved to a stable entry id.
   await execute({});
@@ -893,16 +896,15 @@ test("lifecycle leases every snapshot store referenced anywhere in the session",
   ].sort());
 });
 
-test("tool calls fail closed when snapshot protection cannot be established", async () => {
+test("tool calls warn without accessing snapshots when protection cannot be established", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-protection-failure-"));
   cleanup.push(cwd);
   const run = harness(cwd);
   mkdirSync(join(run.pruneRoot, ".prune-lock"));
   writeFileSync(join(run.pruneRoot, ".prune-lock", "owner.json"), "{}\n");
-  await assert.rejects(
-    run.handlers.tool_call!({ toolName: "write", input: { path: join(cwd, "demo.txt") } }, run.ctx),
-    /refusing snapshot access/,
-  );
+  await run.handlers.tool_call!({ toolName: "write", input: { path: join(cwd, "demo.txt") } }, run.ctx);
+  assert.match(run.notifications.join("\n"), /refusing snapshot access/);
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "file"), false);
 });
 
 test("capture succeeds even when a stale index.lock exists", async () => {
@@ -1078,7 +1080,7 @@ test("cancelled rollback restores the exact pre-rollback tree instead of the jou
   assert.equal(run.entries.some((entry) => entry.customType === "pi-rollback-redo"), false);
 });
 
-test("session switch resets run counters and drops unflushed captures", async () => {
+test("session resume continues run counters and drops unflushed captures", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-session-switch-"));
   cleanup.push(cwd, snapshotDir(cwd));
   const file = join(cwd, "s.txt");
@@ -1102,7 +1104,7 @@ test("session switch resets run counters and drops unflushed captures", async ()
 
   await run.handlers.agent_start!({}, run.ctx);
   await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
-  assert.equal(checkpointLabels().at(-1), "rollback-before-1-0", "run counters restart per session");
+  assert.equal(checkpointLabels().at(-1), "rollback-before-2-0", "run counters continue from the loaded branch");
 });
 
 test("destructive guard can be disabled via PI_ROLLBACK_GUARD_DESTRUCTIVE", async () => {
@@ -1326,4 +1328,51 @@ test("checkpoints command offers the picker with confirm, Esc and decline fall b
   assert.equal(readFileSync(file, "utf8"), "changed\n");
   assert.match(decline.notifications.join("\n"), /Rollback cancelled/);
   assert.match(decline.notifications.join("\n"), /Restore points \(newest first/);
+});
+
+for (const directoryFirst of [false, true]) {
+  test(`tree restore handles file/directory transitions (${directoryFirst}) and literal names`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-transitions-"));
+    cleanup.push(cwd);
+    const path = join(cwd, "item");
+    const names = ["*.txt", "what?.txt", "[abc]", ":literal", " white space ", "line\nbreak"];
+    if (directoryFirst) {
+      mkdirSync(path);
+      writeFileSync(join(path, "child"), "target");
+    } else writeFileSync(path, "target");
+    for (const name of names) writeFileSync(join(cwd, name), "target");
+    const target = await capture(mockPi(), cwd);
+    rmSync(path, { recursive: true });
+    if (directoryFirst) writeFileSync(path, "current");
+    else {
+      mkdirSync(path);
+      writeFileSync(join(path, "child"), "current");
+    }
+    for (const name of names) writeFileSync(join(cwd, name), "current");
+    const { before } = await restore(mockPi(), cwd, target);
+    assert.equal(readFileSync(directoryFirst ? join(path, "child") : path, "utf8"), "target");
+    for (const name of names) assert.equal(readFileSync(join(cwd, name), "utf8"), "target");
+    await restore(mockPi(), cwd, before);
+    assert.equal(readFileSync(directoryFirst ? path : join(path, "child"), "utf8"), "current");
+  });
+}
+
+test("file-state memo captures same-size rewrites with preserved mtime and empty files", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-memo-"));
+  cleanup.push(cwd);
+  const file = join(cwd, "file");
+  writeFileSync(file, "first");
+  const time = statSync(file).mtime;
+  const first = captureFileState(file);
+  writeFileSync(file, "other");
+  utimesSync(file, time, time);
+  const other = captureFileState(file);
+  assert.notDeepEqual(other, first);
+  restoreFileState(file, other);
+  assert.equal(readFileSync(file, "utf8"), "other");
+  writeFileSync(file, "");
+  const empty = captureFileState(file);
+  writeFileSync(file, "changed");
+  restoreFileState(file, empty);
+  assert.equal(readFileSync(file, "utf8"), "");
 });
