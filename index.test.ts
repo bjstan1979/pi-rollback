@@ -14,6 +14,7 @@ import rollbackExtension, {
   restore as restoreSnapshot,
   ROLLBACK_RESULT_EVENT,
   safeHash,
+  validateStagedPaths,
   sessionStore as sessionSnapshotStore,
   snapshotDir as snapshotDirectory,
 } from "./index.js";
@@ -273,6 +274,106 @@ test("root snapshot restores files without touching the project git index", asyn
   assert.equal((await restore(pi, cwd, target)).files, 2);
   assert.equal(readFileSync(join(cwd, "kept.txt"), "utf8"), "before\n");
   assert.equal(existsSync(join(cwd, "created.txt")), false);
+});
+
+test("staged-path validator checks component boundaries and literal NUL-delimited names", () => {
+  const root = "/workspace";
+  const gitDir = "/workspace/custom [store]/sessions/id/repo";
+  for (const path of [".pi/.rollback-snapshots/x", "deep/work/.pi/agent/rollback-snapshots/x", "custom [store]/sessions/id/repo/index", "custom [store]/sessions/x", ".pi/.rollback-snapshots"]) {
+    assert.throws(() => validateStagedPaths(`${path}\0`, root, gitDir), /Snapshot refused.*snapshot store/);
+  }
+  validateStagedPaths("", root, gitDir);
+  validateStagedPaths(" sessions/user.json\0.pi/agent/sessions/user.json\0deep/.pi/sessions/x\0.pi/.rollback-snapshots-copy/x\0custom s/sessions/x\0name\\with-backslash\0newline\nfile \0", root, gitDir);
+  assert.throws(() => validateStagedPaths("unterminated", root, gitDir), /NUL termination/);
+});
+
+for (const mode of ["normal", "sandbox"] as const) {
+  for (const scope of ["ancestor", "agent"] as const) {
+    test(`nested stores stay out of repeated ${mode} captures from ${scope}, including a dirty old index`, async () => {
+      const base = mkdtempSync(join(tmpdir(), "pi-rollback-nested-"));
+      cleanup.push(base);
+      const agent = join(base, ".pi", "agent");
+      mkdirSync(agent, { recursive: true });
+      const cwd = scope === "agent" ? agent : base;
+      const storeBase = mode === "normal"
+        ? sessionSnapshotStore("nested-test", join(agent, "rollback-snapshots"))
+        : join(cwd, ".pi", ".rollback-snapshots", safeHash("nested-test"));
+      const gitDir = snapshotDirectory(cwd, storeBase);
+      const reserved = [".pi/.rollback-snapshots/old/index", ".pi/agent/rollback-snapshots/old/objects/blob",
+        "arbitrary/deep/worktree/.pi/.rollback-snapshots/old/objects/blob",
+        "arbitrary/deep/worktree/.pi/agent/rollback-snapshots/old/index"];
+      const ordinary = ["kept.txt", "sessions/user.json", ".pi/sessions/user.json", ".pi/agent/sessions/user.json",
+        "arbitrary/deep/worktree/.pi/sessions/user.json", "literal[*]? file\n.txt", " leading and trailing "];
+      for (const path of [...reserved, ...ordinary]) {
+        mkdirSync(join(cwd, path, ".."), { recursive: true });
+        writeFileSync(join(cwd, path), "before\n");
+      }
+      mkdirSync(join(cwd, "empty/.pi/.rollback-snapshots"), { recursive: true });
+      mkdirSync(gitDir, { recursive: true });
+      const initialized = spawnSync("git", ["--git-dir", gitDir, "--work-tree", cwd, "init"], { cwd, encoding: "utf8" });
+      assert.equal(initialized.status, 0, initialized.stderr);
+      // Simulate an old shadow index that already tracked a reserved path.
+      assert.equal(spawnSync("git", ["--git-dir", gitDir, "--work-tree", cwd, "add", "-f", "--", reserved[0]!], { cwd }).status, 0);
+      const target = await captureSnapshot(mockPi(), cwd, storeBase);
+      const list = spawnSync("git", ["--git-dir", gitDir, "ls-tree", "-rz", "--name-only", target], { encoding: "utf8" });
+      assert.equal(list.status, 0);
+      assert.deepEqual(list.stdout.split("\0").filter(Boolean).sort(), [...ordinary].sort());
+      const rules = readFileSync(join(gitDir, "info/exclude"), "utf8");
+      assert.ok(rules.includes("**/.pi/.rollback-snapshots/\n"));
+      assert.ok(rules.includes("**/.pi/agent/rollback-snapshots/\n"));
+      assert.equal(await captureSnapshot(mockPi(), cwd, storeBase), target);
+      for (const path of ordinary) writeFileSync(join(cwd, path), "after\n");
+      assert.equal((await restoreSnapshot(mockPi(), cwd, target, storeBase)).files, ordinary.length);
+      for (const path of [...ordinary, ...reserved]) assert.equal(readFileSync(join(cwd, path), "utf8"), "before\n");
+      assert.equal(await captureSnapshot(mockPi(), cwd, storeBase), target);
+    });
+  }
+}
+
+test("dynamic snapshot store exclusions escape literal glob characters without hiding user sessions", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-literal-store-"));
+  cleanup.push(cwd);
+  const storeBase = sessionSnapshotStore("literal", join(cwd, "custom [store]*? #!", "snapshots"));
+  mkdirSync(join(cwd, "sessions"));
+  writeFileSync(join(cwd, "sessions/user.json"), "user data\n");
+  const tree = await captureSnapshot(mockPi(), cwd, storeBase);
+  assert.equal(await captureSnapshot(mockPi(), cwd, storeBase), tree);
+  const listed = spawnSync("git", ["--git-dir", snapshotDirectory(cwd, storeBase), "ls-tree", "-rz", "--name-only", tree], { encoding: "utf8" });
+  assert.equal(listed.status, 0);
+  assert.equal(listed.stdout, "sessions/user.json\0");
+});
+
+for (const injected of ["nested/.pi/.rollback-snapshots/old/blob", "nested/.pi/agent/rollback-snapshots/old/blob", "custom-store/sessions/old/blob"]) {
+  test(`capture fails closed before write-tree/ref if ignore rules fail: ${injected}`, async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-reject-store-"));
+    cleanup.push(cwd);
+    const storeBase = sessionSnapshotStore("injection", join(cwd, "custom-store"));
+    const gitDir = snapshotDirectory(cwd, storeBase);
+    mkdirSync(join(cwd, injected, ".."), { recursive: true });
+    writeFileSync(join(cwd, injected), "must not snapshot\n");
+    const calls: string[][] = [];
+    const pi = {
+      async exec(command: string, args: string[], options?: { cwd?: string }) {
+        calls.push(args);
+        if (args.includes("add")) writeFileSync(join(gitDir, "info/exclude"), "");
+        return exec(command, args, options);
+      },
+    } as ExtensionAPI;
+    await assert.rejects(captureSnapshot(pi, cwd, storeBase), /Snapshot refused: staged rollback snapshot store path/);
+    assert.equal(calls.some((args) => args.includes("write-tree") || args.includes("update-ref")), false);
+    assert.ok(calls.some((args) => args.includes("ls-files") && args.includes("-z")));
+    const refs = spawnSync("git", ["--git-dir", gitDir, "for-each-ref"], { encoding: "utf8" });
+    assert.equal(refs.status, 0);
+    assert.equal(refs.stdout, "");
+  });
+}
+
+test("empty workspaces capture and repeat successfully", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-empty-"));
+  cleanup.push(cwd);
+  const target = await capture(mockPi(), cwd);
+  assert.equal(await capture(mockPi(), cwd), target);
+  assert.equal((await restore(mockPi(), cwd, target)).files, 0);
 });
 
 test("snapshot keeps readable files when Git skips an unindexable path", async () => {

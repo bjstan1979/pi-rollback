@@ -141,6 +141,8 @@ Once an inactive session store is pruned, resuming that old conversation does no
 
 - Conversation rollback uses Pi's non-destructive `ctx.navigateTree()`.
 - Project Git branches, commits, index, and stash list are not modified.
+- Shadow Git excludes `**/.pi/.rollback-snapshots/` and `**/.pi/agent/rollback-snapshots/` at every nesting depth, including old stores in nested worktrees, in addition to the dynamically located snapshot repository/store directories. Dynamic paths are escaped as literal Gitignore paths. Ordinary `sessions/` directories (including `.pi/agent/sessions/`) remain eligible user files; there is no generic sessions exclusion.
+- After staging, every capture checks the raw NUL-delimited `git ls-files -z` listing for reserved rollback-store path components and dynamic store directories. A matching path or malformed listing rejects the capture with an explicit error **before `write-tree` or `update-ref`**, so failed exclusion rules cannot publish a recursive snapshot ref. The shadow index is rebuilt from empty on every capture, removing old tracked store paths. This prevents new recursive snapshots; it does not delete objects or refs from previously contaminated stores.
 - Root restores are reversed if a Git operation, tree navigation, or cancellation interrupts the rollback.
 - A sandbox process refuses checkpoint data targeting paths outside its cwd.
 

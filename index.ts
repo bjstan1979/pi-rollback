@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -181,20 +181,39 @@ function sandboxStore(cwd: string, sessionId: string): string {
   return join(cwd, ".pi", ".rollback-snapshots", safeHash(sessionId));
 }
 
-async function git(pi: ExtensionAPI, cwd: string, args: string[]): Promise<string> {
+async function git(pi: ExtensionAPI, cwd: string, args: string[], trim = true): Promise<string> {
   const result = await pi.exec("git", args, { cwd, timeout: 30_000 });
   if (result.code !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
-  return result.stdout.trim();
+  return trim ? result.stdout.trim() : result.stdout;
+}
+
+function nestedStorePaths(root: string, gitDir: string): string[] {
+  return [...new Set([gitDir, dirname(gitDir), dirname(dirname(gitDir)), SNAPSHOT_ROOT]
+    .map((candidate) => relative(root, candidate))
+    .filter((path) => path && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path))
+    .map((path) => path.split(sep).join("/")))];
+}
+
+/** Validate raw `git ls-files -z` output, without trimming literal file names. */
+export function validateStagedPaths(output: string, root: string, gitDir: string): void {
+  if (output && !output.endsWith("\0")) throw new Error("Snapshot refused: malformed staged-path listing (expected NUL termination)");
+  const stores = nestedStorePaths(root, gitDir);
+  for (const path of output ? output.slice(0, -1).split("\0") : []) {
+    if (!path || path.startsWith("/") || path.split("/").some((part) => part === ".." || part === ".")) {
+      throw new Error(`Snapshot refused: invalid staged path ${JSON.stringify(path)}`);
+    }
+    if (/(?:^|\/)\.pi\/(?:\.rollback-snapshots|agent\/rollback-snapshots)(?:\/|$)/.test(path)
+      || stores.some((store) => path === store || path.startsWith(`${store}/`))) {
+      throw new Error(`Snapshot refused: staged rollback snapshot store path ${JSON.stringify(path)}; no snapshot ref was created`);
+    }
+  }
 }
 
 function excludeNestedStore(root: string, gitDir: string): void {
-  const exclusions: string[] = [];
-  for (const candidate of [gitDir, dirname(gitDir), dirname(dirname(gitDir)), SNAPSHOT_ROOT]) {
-    const scoped = relative(root, candidate);
-    if (scoped && !scoped.startsWith("..") && !isAbsolute(scoped)) exclusions.push(`/${scoped.replaceAll("\\", "/")}/`);
-  }
+  const exclusions = ["**/.pi/.rollback-snapshots/", "**/.pi/agent/rollback-snapshots/",
+    // Gitignore patterns are not literal paths: quote metacharacters and spaces.
+    ...nestedStorePaths(root, gitDir).map((path) => `/${path.replace(/[\\*?\[\]!# ]/g, "\\$&")}/`)];
   const unique = [...new Set(exclusions)];
-  if (!unique.length) return;
   mkdirSync(join(gitDir, "info"), { recursive: true, mode: 0o700 });
   writeFileSync(join(gitDir, "info", "exclude"), `${unique.join("\n")}\n`, { mode: 0o600 });
 }
@@ -217,6 +236,7 @@ async function captureInternal(pi: ExtensionAPI, cwd: string, storeBase: string)
   excludeNestedStore(cwd, gitDir);
   // ponytail: root snapshots include every non-ignored file; native file tools use the cheaper journal path.
   await stageSnapshot(pi, cwd, gitDir);
+  validateStagedPaths(await git(pi, cwd, ["--git-dir", gitDir, "--work-tree", cwd, "ls-files", "-z"], false), cwd, gitDir);
   const tree = await git(pi, cwd, ["--git-dir", gitDir, "write-tree"]);
   await git(pi, cwd, ["--git-dir", gitDir, "update-ref", `refs/pi-rollback/trees/${tree}`, tree]);
   touchActivity(/^[0-9a-f]{24}$/.test(storeBase.split(/[\\/]/).at(-1) ?? "") ? storeBase : gitDir);

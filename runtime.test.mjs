@@ -14,6 +14,8 @@
 // - plus the journal helpers the rollback engine relies on (destructive-command
 //   detection, path scoping, file-state restore semantics).
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -258,6 +260,68 @@ test("a cancelled rollback restores the exact workspace state, including unjourn
 	assert.equal(result.ok, false);
 	assert.equal(result.error, "Rollback cancelled");
 	assert.deepEqual(harness.entriesOf("pi-rollback-redo"), [], "a cancelled rollback must not arm redo");
+});
+
+test("deep-tracking loader snapshots exclude nested rollback stores but restore ordinary sessions", async (t) => {
+	const harness = await loadRollback(t, { deepTracking: true });
+	const { work, layout } = harness;
+	// These are inert fixtures inside the temporary workspace, never global stores.
+	const sentinels = [
+		".pi/.rollback-snapshots/legacy-sentinel.txt",
+		".pi/agent/rollback-snapshots/current-sentinel.txt",
+		"nested/project/.pi/.rollback-snapshots/legacy-sentinel.txt",
+		"nested/project/.pi/agent/rollback-snapshots/current-sentinel.txt",
+	];
+	const ordinary = [
+		"ordinary.txt",
+		"sessions/state.json",
+		".pi/agent/sessions/state.json",
+		"nested/project/.pi/agent/sessions/state.json",
+	];
+	for (const path of [...sentinels, ...ordinary]) {
+		await mkdir(join(work, path, ".."), { recursive: true });
+		await writeFile(join(work, path), `before:${path}`);
+	}
+
+	await harness.beginTurn(0);
+	const saved = await harness.runTool("checkpoint", { label: "before nested stores" });
+	assert.equal(saved.details.saved, true);
+	// Shell changes exercise real Git root snapshots, not just per-file blobs.
+	await harness.emit("tool_call", { toolName: "bash", input: { command: "printf changed > ordinary.txt" } });
+	for (const path of [...sentinels, ...ordinary]) {
+		await writeFile(join(work, path), `after:${path}`);
+	}
+	await harness.emit("turn_end", { turnIndex: 0 });
+	const mutations = harness.entriesOf("pi-rollback-mutation");
+	assert.equal(mutations.length, 1, "shell changes must produce a root mutation, not a skipped capture");
+	const mutation = mutations[0];
+	assert.equal(mutation.kind, "root");
+	assert.equal(mutation.root, work);
+	const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+	assert.equal(mutation.storeBase, join(layout, "sessions", hash("session-a")), "snapshot storage must remain in the isolated layout");
+	const gitDir = join(mutation.storeBase, hash(work));
+	const git = (...args) => execFileSync("git", ["--git-dir", gitDir, ...args], { cwd: work, encoding: "utf8" });
+	const assertTree = (tree, phase) => {
+		const paths = git("ls-tree", "-r", "--name-only", "-z", tree).split("\0").filter(Boolean);
+		assert.equal(paths.some((path) => /(?:^|\/)\.pi\/(?:\.rollback-snapshots|agent\/rollback-snapshots)(?:\/|$)/.test(path)), false, "snapshot trees must not contain either rollback store at any depth");
+		for (const path of sentinels) assert.equal(paths.includes(path), false, `${path} must never be captured`);
+		for (const path of ordinary) {
+			assert.ok(paths.includes(path), `${path} must be captured, not over-excluded`);
+			if (phase) assert.equal(git("show", `${tree}:${path}`), `${phase}:${path}`);
+		}
+	};
+	assertTree(mutation.before, "before");
+	assertTree(mutation.after, "after");
+
+	await harness.runCommand("rollback", "before nested stores");
+	assert.equal(harness.entriesOf("pi-rollback-result").at(-1)?.ok, true);
+	assert.equal(harness.navigations.length, 1, "rollback must navigate through the real registered command");
+	for (const path of ordinary) assert.equal(await readFile(join(work, path), "utf8"), `before:${path}`, `${path} must be restored`);
+	for (const path of sentinels) assert.equal(await readFile(join(work, path), "utf8"), `after:${path}`, `${path} must remain untouched by rollback`);
+	// Include snapshots made while preparing rollback/redo, not only the mutation.
+	const trees = git("for-each-ref", "--format=%(objectname)", "refs/pi-rollback/trees/").trim().split("\n");
+	assert.ok(trees.length >= 2);
+	for (const tree of trees) assertTree(tree);
 });
 
 test("session resume continues counters and drops unflushed captures", async (t) => {
