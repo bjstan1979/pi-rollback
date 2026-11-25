@@ -155,8 +155,13 @@ function parseNonNegative(value: unknown, name: PruneSettingName, fallback: numb
 
 function parseToggle(value: unknown): boolean {
   if (value === undefined) return true;
-  if (value === true || value === 1 || value === "1") return true;
-  if (value === false || value === 0 || value === "0") return false;
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true") return true;
+    if (normalized === "0" || normalized === "false") return false;
+  }
   throw new Error("PI_ROLLBACK_PRUNE must be 0, 1, false, or true");
 }
 

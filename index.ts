@@ -552,7 +552,7 @@ export interface RestoreOption {
   /** Line shown in the picker/list. */
   display: string;
   /** Exact args that restore this point. */
-  args: Pick<RollbackArgs, "targetLabel">;
+  args: Pick<RollbackArgs, "targetEntryId">;
   /** Human-typable command hint. */
   command: string;
   /** True when the option anchors on a user message. */
@@ -565,7 +565,7 @@ export interface RestoreOption {
  * are deliberately collapsed — they carry no information a human can act on.
  */
 export function buildRestoreMenu(ctx: BranchContext, limit = 20): RestoreOption[] {
-  const all = checkpoints(ctx);
+  const all = resolvedCheckpoints(ctx);
   const snippets = new Map<string, string>();
   for (const entry of activeEntries(ctx)) {
     const text = firstUserText(entry);
@@ -583,15 +583,15 @@ export function buildRestoreMenu(ctx: BranchContext, limit = 20): RestoreOption[
       const ago = relativeTime(checkpoint.createdAt);
       const current = runNo === latestRun ? " · current run" : "";
       const display = message ? `“${message}” · ${ago}${current}` : `start of run ${runNo} · ${ago}${current}`;
-      options.push({ display, args: { targetLabel: checkpoint.label }, command: `/rollback run ${runCount}`, message });
+      options.push({ display, args: { targetEntryId: checkpoint.resolvedEntryId }, command: `/rollback run ${runCount}`, message });
       continue;
     }
     if (checkpoint.label.startsWith("auto-before-destructive")) {
-      options.push({ display: `! before destructive command · ${relativeTime(checkpoint.createdAt)}`, args: { targetLabel: checkpoint.label }, command: `/rollback ${checkpoint.label}` });
+      options.push({ display: `! before destructive command · ${relativeTime(checkpoint.createdAt)}`, args: { targetEntryId: checkpoint.resolvedEntryId }, command: `/rollback ${checkpoint.label}` });
       continue;
     }
     if (AUTO_TURN_LABEL.test(checkpoint.label)) continue;
-    options.push({ display: `${checkpoint.label} · ${relativeTime(checkpoint.createdAt)}`, args: { targetLabel: checkpoint.label }, command: `/rollback ${checkpoint.label}` });
+    options.push({ display: `${checkpoint.label} · ${relativeTime(checkpoint.createdAt)}`, args: { targetEntryId: checkpoint.resolvedEntryId }, command: `/rollback ${checkpoint.label}` });
   }
   const visible = limit > 0 ? options.slice(0, limit) : options;
   // The picker returns the chosen display string, so displays must be unique:
@@ -703,10 +703,12 @@ export function resolvedCheckpoints(ctx: BranchContext): ResolvedCheckpoint[] {
 function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): ResolvedCheckpoint {
   const all = resolvedCheckpoints(ctx);
   const counts = [args.count, args.runCount, args.turnCount].filter((value) => value !== undefined);
-  if ((args.targetEntryId || args.targetLabel) && counts.length) throw new Error("Rollback target is ambiguous");
-  if (counts.length > 1) throw new Error("Rollback target is ambiguous");
+  const selectors = (args.targetEntryId !== undefined ? 1 : 0) + (args.targetLabel !== undefined ? 1 : 0) + counts.length;
+  if (selectors > 1) throw new Error("Rollback target is ambiguous");
   if (args.targetEntryId) {
-    const found = all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId || checkpoint.resolvedEntryId === args.targetEntryId);
+    const found =
+      all.findLast((checkpoint) => checkpoint.resolvedEntryId === args.targetEntryId) ??
+      all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId);
     if (found) return found;
     throw new Error(`No active checkpoint for entry ${args.targetEntryId}`);
   }
@@ -862,7 +864,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   // unchanged note repeated it in nearly every request (~50 tokens each) while
   // the model spent reasoning steps deciding it was "just a reminder" rather
   // than a user message.
-  let emittedResultKey: string | undefined;
+  const emittedResultKeys = new Set<string>();
   let emittedPointsSignature: string | undefined;
   let emittedNudgePath: string | undefined;
   const labeledEntries = new Set<string>();
@@ -1072,7 +1074,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     // instead of restarting at 1: duplicated `rollback-before-1-0` labels made
     // label lookups pick the wrong run and tagged old runs as "current run".
     agentRun = 0;
-    emittedResultKey = undefined;
+    emittedResultKeys.clear();
     try {
       const existing = checkpoints(ctx);
       for (const checkpoint of existing) {
@@ -1080,9 +1082,15 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         const run = /^(?:rollback-(?:before|after)|auto-before-destructive)-(\d+)-\d+$/.exec(checkpoint.label);
         if (run) agentRun = Math.max(agentRun, Number(run[1]));
       }
-      // Do not replay a rollback outcome from an earlier process as news.
-      const last = latestRollbackResult(activeEntries(ctx));
-      if (last) emittedResultKey = resultKey(last);
+      // Do not replay rollback outcomes from an earlier process as news.
+      const sessionEntries = typeof ctx.sessionManager.getEntries === "function"
+        ? ctx.sessionManager.getEntries()
+        : activeEntries(ctx);
+      for (const entry of sessionEntries) {
+        if (entry.type !== "custom" || entry.customType !== RESULT_TYPE) continue;
+        const data = entry.data as RollbackResult | undefined;
+        if (data?.version === 1) emittedResultKeys.add(resultKey(entry.id, data));
+      }
     } catch {}
     if (pendingFiles.size || pendingRoots.size) {
       notify(ctx, `Rollback dropped ${pendingFiles.size + pendingRoots.size} unflushed capture(s) from the previous session`);
@@ -1139,12 +1147,12 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   });
 
   const clip = (value: string, max = 80): string => (value.length > max ? `${value.slice(0, max)}…` : value);
-  const resultKey = (result: RollbackResult): string => `${result.createdAt}:${result.ok ? "ok" : "failed"}:${result.files ?? 0}`;
-  const latestRollbackResult = (entries: readonly SessionEntry[]): RollbackResult | undefined =>
-    entries.reduce<RollbackResult | undefined>((latest, entry) => {
+  const resultKey = (entryId: string, result: RollbackResult): string => `${entryId}:${result.createdAt}:${result.ok ? "ok" : "failed"}:${result.files ?? 0}`;
+  const latestRollbackResult = (entries: readonly SessionEntry[]): { entryId: string; data: RollbackResult } | undefined =>
+    entries.reduce<{ entryId: string; data: RollbackResult } | undefined>((latest, entry) => {
       if (entry.type !== "custom" || entry.customType !== RESULT_TYPE) return latest;
       const data = entry.data as RollbackResult | undefined;
-      return data?.version === 1 ? data : latest;
+      return data?.version === 1 ? { entryId: entry.id, data } : latest;
     }, undefined);
 
   /**
@@ -1158,15 +1166,15 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
     // `context` fires for every model request: read the branch once and reuse it.
     const entries = activeEntries(ctx);
     const branch: BranchContext = { sessionManager: { getBranch: () => entries } };
-    const result = latestRollbackResult(entries);
+    const latest = latestRollbackResult(entries);
     const lines: string[] = [];
-    if (result) {
-      const key = resultKey(result);
-      if (key !== emittedResultKey) {
-        emittedResultKey = key;
-        lines.push(result.ok
-          ? `Rollback ok: restored ${result.files ?? 0} file(s) to "${clip(result.targetLabel ?? result.targetEntryId ?? "unknown")}".`
-          : `Rollback failed: ${clip(result.error ?? "unknown error", 200)}`);
+    if (latest) {
+      const key = resultKey(latest.entryId, latest.data);
+      if (!emittedResultKeys.has(key)) {
+        emittedResultKeys.add(key);
+        lines.push(latest.data.ok
+          ? `Rollback ok: restored ${latest.data.files ?? 0} file(s) to "${clip(latest.data.targetLabel ?? latest.data.targetEntryId ?? "unknown")}".`
+          : `Rollback failed: ${clip(latest.data.error ?? "unknown error", 200)}`);
       }
     }
     const all = checkpoints(branch);
@@ -1395,6 +1403,8 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         await undoApplied(pi, applied, options.blobRoot, (message) => notify(ctx, message));
         throw new Error("Redo cancelled");
       }
+      const restoredResult = latestRollbackResult(activeEntries(ctx));
+      if (restoredResult) emittedResultKeys.add(resultKey(restoredResult.entryId, restoredResult.data));
       if (ctx.hasUI) ctx.ui.notify(`Redid ${files} file(s) and restored checkpoint branch ${redo.targetLabel}`, "info");
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

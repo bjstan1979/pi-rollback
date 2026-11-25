@@ -93,6 +93,12 @@ test("prune config accepts defaults and zero while invalid values disable with o
   assert.equal(zero.enabled, true);
   assert.deepEqual([zero.retentionMs, zero.maxBytes, zero.intervalMs, zero.migrationGraceMs], [0, 0, 0, 0]);
   assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: "0" }).warning, undefined);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: "true" }).enabled, true);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: "true" }).warning, undefined);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: " TRUE " }).enabled, true);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: "false" }).enabled, false);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: "false" }).warning, undefined);
+  assert.equal(parsePruneConfig({ PI_ROLLBACK_PRUNE: " False " }).enabled, false);
 
   for (const env of [
     { PI_ROLLBACK_PRUNE: "yes" },

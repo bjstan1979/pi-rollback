@@ -1477,3 +1477,95 @@ test("file-state memo captures same-size rewrites with preserved mtime and empty
   restoreFileState(file, empty);
   assert.equal(readFileSync(file, "utf8"), "");
 });
+
+test("picker restores the selected older checkpoint when multiple checkpoints share a label", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-dup-label-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+
+  const run = harness(cwd, {
+    selectResolver: (choices) => choices.find((choice) => choice.includes("(#2)")),
+  });
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "state-A\n");
+  await run.commands.checkpoint!("before refactor", run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "state-B\n");
+  await run.commands.checkpoint!("before refactor", run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 1 }, run.ctx);
+
+  const dups = run.entries.filter((entry) => entry.customType === "pi-rollback-checkpoint" && (entry.data as { label?: string }).label === "before refactor");
+  assert.equal(dups.length, 2);
+  (dups[0]!.data as { createdAt: number }).createdAt = (dups[1]!.data as { createdAt: number }).createdAt;
+  writeFileSync(file, "state-C\n");
+
+  await run.commands.rollback!("", run.ctx);
+  assert.equal(run.navigatedTo(), dups[0]!.id);
+  assert.equal(readFileSync(file, "utf8"), "state-A\n");
+});
+
+test("rollback rejects conflicting targetEntryId and targetLabel as ambiguous", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-ambiguous-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "state-A\n");
+
+  const run = harness(cwd);
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("AAA", run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "state-B\n");
+  await run.handlers.turn_end!({ turnIndex: 1 }, run.ctx);
+
+  const second = run.entries.find((entry) => entry.customType === "pi-rollback-checkpoint" && (entry.data as { label?: string }).label === "rollback-before-1-1");
+  assert.ok(second);
+  await run.commands.rollback!(JSON.stringify({ targetEntryId: second!.id, targetLabel: "AAA" }), run.ctx);
+  const result = run.emitted.at(-1)!.data as { ok: boolean; error?: string };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /ambiguous/i);
+  assert.equal(readFileSync(file, "utf8"), "state-B\n");
+});
+
+test("redo does not replay a stale rollback ok note from before the redone rollback", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-redo-note-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "initial\n");
+
+  const run = harness(cwd);
+  const contextNote = () => {
+    const result = run.handlers.context!({ messages: [] }, run.ctx) as { messages?: Array<{ customType?: string; content?: string }> } | undefined;
+    return result?.messages?.find((message) => message.customType === "pi-rollback-context")?.content;
+  };
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.commands.checkpoint!("before 1", run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  await run.commands.rollback!("before 1", run.ctx);
+  assert.match(contextNote() ?? "", /Rollback ok:.*before 1/);
+
+  await run.handlers.turn_start!({ turnIndex: 1 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: file } }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.commands.checkpoint!("before 2", run.ctx);
+  await run.handlers.turn_end!({ turnIndex: 1 }, run.ctx);
+
+  await run.commands.rollback!("before 2", run.ctx);
+  assert.match(contextNote() ?? "", /Rollback ok:.*before 2/);
+
+  await run.commands.redo!("", run.ctx);
+  const afterRedo = contextNote();
+  assert.equal(afterRedo === undefined || !/Rollback ok/.test(afterRedo), true);
+});

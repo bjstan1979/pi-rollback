@@ -1,5 +1,8 @@
 # pi-rollback
 
+> 审计补充：本包另附 `BUGS.md`（已确认 4 个 bug 的机制、触发和复现）与 `reproduce-bugs.mjs`
+> （`bun reproduce-bugs.mjs` 可一键复现全部 4 项）。源码本身未作修改。
+
 Global Pi extension for rolling conversation context and workspace files back to an earlier checkpoint.
 
 ## Install
