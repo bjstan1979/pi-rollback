@@ -1,8 +1,8 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import rollbackExtension, {
@@ -142,7 +142,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; confirmValue?: boolean; inputValue?: string | undefined; noUI?: boolean } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; confirmValue?: boolean; inputValue?: string | undefined; noUI?: boolean; execImpl?: typeof exec } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -174,7 +174,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
   const sentMessages: Array<{ content: string; options: unknown }> = [];
   const emitted: Array<{ event: string; data: unknown }> = [];
   const pi = {
-    exec,
+    exec: options.execImpl ?? exec,
     events: { emit(event: string, data: unknown) { emitted.push({ event, data }); } },
     on(name: string, handler: (event: any, ctx: any) => Promise<any>) { handlers[name] = handler; },
     registerCommand(name: string, options: { handler: (args: string, ctx: any) => Promise<void> }) { commands[name] = options.handler; },
@@ -641,6 +641,54 @@ test("tracks a bash mutation in another project root", async () => {
   assert.equal(readFileSync(file, "utf8"), "bash original\n");
 });
 
+test("deep tracking walks to an existing directory before git cwd", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-missing-sub-"));
+  const external = mkdtempSync(join(tmpdir(), "pi-rollback-missing-sub-ext-"));
+  const broad = mkdtempSync(join(tmpdir(), "pi-rollback-missing-sub-broad-"));
+  cleanup.push(cwd, external, broad, snapshotDir(cwd), snapshotDir(external));
+  assert.equal(spawnSync("git", ["init"], { cwd: external }).status, 0);
+  const remote = join(external, "demo.txt");
+  const broadFile = join(broad, "demo.txt");
+  writeFileSync(remote, "remote original\n");
+  writeFileSync(broadFile, "broad original\n");
+  const missing = join(external, "newdir", "sub", "out.txt");
+  const broadMissing = join(broad, "newdir", "sub", "out.txt");
+  const throwingExec: typeof exec = (command, args, options) => {
+    if (options?.cwd && !existsSync(options.cwd)) {
+      const error = new Error(`spawn ${command} ENOENT`) as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+    return exec(command, args, options);
+  };
+  const run = harness(cwd, { deepTracking: true, execImpl: throwingExec });
+
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({
+    toolName: "bash",
+    input: { command: `mkdir -p ${join(external, "newdir", "sub")} && echo hi > ${missing}` },
+  }, run.ctx);
+  writeFileSync(remote, "remote changed\n");
+  assert.equal(run.notifications.some((message) => message.includes("preflight skipped")), false);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+  await run.commands.rollback!("1", run.ctx);
+  assert.equal(readFileSync(remote, "utf8"), "remote original\n");
+
+  const unscoped = harness(cwd, { deepTracking: true, execImpl: throwingExec });
+  await unscoped.handlers.agent_start!({}, unscoped.ctx);
+  await unscoped.handlers.turn_start!({ turnIndex: 0 }, unscoped.ctx);
+  await unscoped.handlers.tool_call!({
+    toolName: "bash",
+    input: { command: `mkdir -p ${join(broad, "newdir", "sub")} && echo hi > ${broadMissing}` },
+  }, unscoped.ctx);
+  writeFileSync(broadFile, "broad changed\n");
+  assert.equal(unscoped.notifications.some((message) => message.includes("preflight skipped")), false);
+  await unscoped.handlers.turn_end!({ turnIndex: 0 }, unscoped.ctx);
+  await unscoped.commands.rollback!("1", unscoped.ctx);
+  assert.equal(readFileSync(broadFile, "utf8"), "broad changed\n");
+});
+
 test("turn start never rescans historical shell roots", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-turn-cwd-"));
   const external = mkdtempSync(join(tmpdir(), "pi-rollback-turn-external-"));
@@ -712,6 +760,23 @@ test("sandbox detection uses canonical active modes and path filtering", () => {
   cleanup.push(cwd, external);
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, true), []);
   assert.deepEqual(mutationPaths("write", { path: join(external, "x.txt") }, cwd, false), [join(external, "x.txt")]);
+});
+
+test("write and edit journal @ mentions and ~/ paths the way Pi resolves them", () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-rollback-at-home-")));
+  cleanup.push(cwd);
+  const home = realpathSync(homedir());
+  const mention = join(cwd, "src", "app.ts");
+  assert.deepEqual(mutationPaths("write", { path: "@src/app.ts" }, cwd, false), [mention]);
+  assert.deepEqual(mutationPaths("edit", { path: "@src/app.ts" }, cwd, false), [mention]);
+  assert.deepEqual(mutationPaths("write", { path: "~/pi-rollback-home-probe.txt" }, cwd, false), [join(home, "pi-rollback-home-probe.txt")]);
+  assert.deepEqual(mutationPaths("edit", { path: "@~/pi-rollback-home-probe.txt" }, cwd, false), [join(home, "pi-rollback-home-probe.txt")]);
+
+  const literal = join(cwd, "@literal.txt");
+  writeFileSync(literal, "keep the at sign\n");
+  assert.deepEqual(mutationPaths("edit", { path: "@literal.txt" }, cwd, false), [literal]);
+  // ts_morph is not a Pi write/edit path and must keep the literal spelling.
+  assert.deepEqual(mutationPaths("ts_morph", { filePath: "@src/app.ts" }, cwd, false), [join(cwd, "@src", "app.ts")]);
 });
 
 test("path hints include quoted POSIX and Windows absolute arguments", () => {
@@ -1534,6 +1599,33 @@ test("rollback rejects conflicting targetEntryId and targetLabel as ambiguous", 
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /ambiguous/i);
   assert.equal(readFileSync(file, "utf8"), "state-B\n");
+  assert.notEqual(run.navigatedTo(), second!.id);
+});
+
+test("empty rollback selectors are rejected instead of restoring the previous checkpoint", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-empty-selector-"));
+  cleanup.push(cwd, snapshotDir(cwd));
+  const file = join(cwd, "demo.txt");
+  writeFileSync(file, "original\n");
+  const run = harness(cwd);
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  writeFileSync(file, "changed\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  for (const raw of ['{"targetEntryId":""}', '{"targetLabel":"  "}']) {
+    await run.commands.rollback!(raw, run.ctx);
+    assert.equal(run.navigatedTo(), undefined);
+    assert.equal(readFileSync(file, "utf8"), "changed\n");
+    assert.match(run.notifications.at(-1) ?? "", /Rollback target(?:EntryId|Label) is empty/);
+  }
+
+  const execute = (params: Record<string, unknown>) => run.toolDefs.rollback.execute("tool-1", params, undefined, undefined, run.ctx);
+  await assert.rejects(() => execute({ targetEntryId: "" }), /Rollback targetEntryId is empty/);
+  await assert.rejects(() => execute({ targetLabel: "  " }), /Missing rollback target/);
+  assert.equal(run.sentMessages.length, 0);
+  await execute({ targetEntryId: "custom-1" });
+  assert.equal(run.sentMessages.at(-1)?.content, '/rollback {"targetEntryId":"custom-1"}');
 });
 
 test("redo does not replay a stale rollback ok note from before the redone rollback", async () => {

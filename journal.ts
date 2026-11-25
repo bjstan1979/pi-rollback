@@ -138,13 +138,34 @@ export function restoreFileState(path: string, state: FileState, blobRoot = BLOB
   }
 }
 
+function expandHomePrefix(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) return join(homedir(), value.slice(2));
+  return value;
+}
+
+/**
+ * Pi write/edit (and pi-agent-edit) expand `~/` and strip a leading `@` when
+ * that literal path does not exist. `resolve(cwd, "@src/app.ts")` and
+ * `resolve(cwd, "~/foo")` journal a different file than the tool writes.
+ */
+function normalizeWriteEditPath(input: string, cwd: string): string {
+  let value = input;
+  if (value.startsWith("@") && value.length > 1 && !existsSync(resolve(cwd, value))) {
+    const stripped = value.slice(1);
+    if (stripped.trim()) value = stripped;
+  }
+  return expandHomePrefix(value);
+}
+
 export function mutationPaths(toolName: string, input: unknown, cwd: string, sandboxed: boolean): string[] {
   const value = input && typeof input === "object" ? input as Record<string, unknown> : {};
   let candidate: unknown;
   if (toolName === "write" || toolName === "edit") candidate = value.path;
   else if (toolName === "ts_morph") candidate = value.filePath;
   if (typeof candidate !== "string" || !candidate.trim()) return [];
-  const path = canonicalMutationPath(candidate, cwd);
+  const normalized = toolName === "write" || toolName === "edit" ? normalizeWriteEditPath(candidate, cwd) : candidate;
+  const path = canonicalMutationPath(normalized, cwd);
   return sandboxed && !isWithin(cwd, path) ? [] : [path];
 }
 

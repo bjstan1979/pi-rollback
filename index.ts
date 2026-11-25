@@ -700,22 +700,34 @@ export function resolvedCheckpoints(ctx: BranchContext): ResolvedCheckpoint[] {
     .map((entry) => ({ ...(entry.data as Checkpoint), resolvedEntryId: entry.id }));
 }
 
+/** An explicit selector that is blank after trim is invalid, not "no selector". */
+function presentSelector(value: string | undefined, name: "targetEntryId" | "targetLabel"): string | undefined {
+  if (value === undefined) return undefined;
+  if (!value.trim()) throw new Error(`Rollback ${name} is empty`);
+  return value;
+}
+
 function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): ResolvedCheckpoint {
   const all = resolvedCheckpoints(ctx);
+  // Presence is `!== undefined`, not truthiness. `""` / `"  "` must be rejected
+  // here; a truthy check fell through to `count = 1` and silently restored the
+  // previous checkpoint.
+  const targetEntryId = presentSelector(args.targetEntryId, "targetEntryId");
+  const targetLabel = presentSelector(args.targetLabel, "targetLabel");
   const counts = [args.count, args.runCount, args.turnCount].filter((value) => value !== undefined);
-  const selectors = (args.targetEntryId !== undefined ? 1 : 0) + (args.targetLabel !== undefined ? 1 : 0) + counts.length;
+  const selectors = (targetEntryId !== undefined ? 1 : 0) + (targetLabel !== undefined ? 1 : 0) + counts.length;
   if (selectors > 1) throw new Error("Rollback target is ambiguous");
-  if (args.targetEntryId) {
+  if (targetEntryId !== undefined) {
     const found =
-      all.findLast((checkpoint) => checkpoint.resolvedEntryId === args.targetEntryId) ??
-      all.findLast((checkpoint) => checkpoint.entryId === args.targetEntryId);
+      all.findLast((checkpoint) => checkpoint.resolvedEntryId === targetEntryId) ??
+      all.findLast((checkpoint) => checkpoint.entryId === targetEntryId);
     if (found) return found;
-    throw new Error(`No active checkpoint for entry ${args.targetEntryId}`);
+    throw new Error(`No active checkpoint for entry ${targetEntryId}`);
   }
-  if (args.targetLabel) {
-    const found = all.findLast((checkpoint) => checkpoint.label === args.targetLabel);
+  if (targetLabel !== undefined) {
+    const found = all.findLast((checkpoint) => checkpoint.label === targetLabel);
     if (found) return found;
-    throw new Error(`No active checkpoint labelled ${args.targetLabel}`);
+    throw new Error(`No active checkpoint labelled ${targetLabel}`);
   }
   if (args.runCount !== undefined) {
     const starts = all.filter((checkpoint) => isRunStartLabel(checkpoint.label));
@@ -749,15 +761,32 @@ function findCheckpoint(ctx: CheckpointContext, args: RollbackArgs): ResolvedChe
   return all[target]!;
 }
 
+/**
+ * Directory git can use as cwd. One `dirname` is not enough for
+ * `mkdir -p /proj/newdir/sub && > /proj/newdir/sub/out.txt`: the parent still
+ * does not exist, and `posix_spawn` ENOENT aborts the whole preflight before
+ * `ctx.cwd` is snapshotted. Walk up to the nearest existing directory.
+ */
 function rootDirectory(path: string): string {
-  if (existsSync(path) && statSync(path).isDirectory()) return path;
-  return dirname(path);
+  let current = path;
+  for (;;) {
+    if (existsSync(current)) return statSync(current).isDirectory() ? current : dirname(current);
+    const parent = dirname(current);
+    if (parent === current) return current;
+    current = parent;
+  }
 }
 
 async function projectRoot(pi: ExtensionAPI, path: string): Promise<string> {
   const directory = rootDirectory(path);
   const result = await pi.exec("git", ["-C", directory, "rev-parse", "--show-toplevel"], { cwd: directory, timeout: 5_000 });
-  return result.code === 0 && result.stdout.trim() ? result.stdout.trim() : directory;
+  if (result.code === 0 && result.stdout.trim()) return result.stdout.trim();
+  if (existsSync(path) && statSync(path).isDirectory()) return path;
+  // The walk above only exists so `git -C` has a real cwd. If that ancestor is
+  // not a git toplevel, snapshotting it would cover /tmp or another tree far
+  // broader than `mkdir -p a/b`. Keep the immediate parent and let addRoot skip
+  // it when it does not exist yet.
+  return dirname(path);
 }
 
 /** Roots a deep-tracking shell snapshot must never cover (`git add --all` of / or ~). */
@@ -1593,7 +1622,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       let target: ResolvedCheckpoint;
       if (
         query.count === undefined && query.runCount === undefined && query.turnCount === undefined
-        && !query.targetLabel && !query.targetEntryId
+        && query.targetLabel === undefined && query.targetEntryId === undefined
       ) {
         // Default target: the start of the current agent run (the common
         // "undo everything this run did" case).
