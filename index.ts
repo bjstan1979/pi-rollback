@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+  bashFileMutationHints,
   bashPathHints,
   canonicalMutationPath,
   captureFileState,
@@ -16,6 +17,7 @@ import {
   mutationPaths,
   restoreFileState,
   sameFileState,
+  verifyRestoreFileState,
 } from "./journal.js";
 import {
   assertSafeLayoutRoot,
@@ -789,18 +791,95 @@ async function projectRoot(pi: ExtensionAPI, path: string): Promise<string> {
   return dirname(path);
 }
 
-/** Roots a deep-tracking shell snapshot must never cover (`git add --all` of / or ~). */
-export function unsafeSnapshotRoot(root: string): boolean {
-  const absolute = resolve(root);
-  if (dirname(absolute) === absolute) return true;
-  const home = homedir();
-  if (absolute === resolve(home) || isWithin(resolve(home), absolute)) return true;
-  return isNonWorkspacePath(absolute);
+function canonicalizePath(path: string): string {
+  const absolute = resolve(path);
+  return existsSync(absolute) ? realpathSync(absolute) : absolute;
 }
 
-function addRoot(roots: Set<string>, root: string): void {
+function expandWorkspaceEntry(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === "~") return homedir();
+  if (trimmed.startsWith("~/") || (process.platform === "win32" && trimmed.startsWith("~\\"))) {
+    return join(homedir(), trimmed.slice(2));
+  }
+  return trimmed;
+}
+
+/**
+ * Hard-forbidden snapshot roots. These can NEVER be opted in via
+ * PI_ROLLBACK_WORKSPACE_ROOTS: `/`, `$HOME` itself, system pseudo-paths, and
+ * the Pi agent directory (which is full of nested git repos and snapshots).
+ */
+function isForbiddenSnapshotRoot(canonical: string, home: string): boolean {
+  if (dirname(canonical) === canonical) return true;
+  if (canonical === home) return true;
+  if (isNonWorkspacePath(canonical)) return true;
+  const agentDir = canonicalizePath(getAgentDir());
+  if (canonical === agentDir || isWithin(agentDir, canonical)) return true;
+  return false;
+}
+
+export function parseWorkspaceRoots(raw: unknown): string[] {
+  let items: string[] = [];
+  if (Array.isArray(raw)) {
+    items = raw.filter((v): v is string => typeof v === "string");
+  } else if (typeof raw === "string") {
+    items = raw.split(new RegExp(`[${delimiter === ";" ? ";," : ":,"}\\n]+`));
+  } else {
+    return [];
+  }
+  const home = canonicalizePath(homedir());
+  const result = new Set<string>();
+  for (const item of items) {
+    const expanded = expandWorkspaceEntry(item);
+    if (!expanded || !isAbsolute(expanded)) continue;
+    const canonical = canonicalizePath(expanded);
+    if (isForbiddenSnapshotRoot(canonical, home)) continue;
+    result.add(canonical);
+  }
+  return [...result];
+}
+
+function readWorkspaceRoots(settingsPath: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (env.PI_ROLLBACK_WORKSPACE_ROOTS !== undefined) {
+    return parseWorkspaceRoots(env.PI_ROLLBACK_WORKSPACE_ROOTS);
+  }
+  if (!existsSync(settingsPath)) return [];
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(settingsPath, "utf8").replace(/^\uFEFF/, ""));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+    return parseWorkspaceRoots((parsed as Record<string, unknown>).PI_ROLLBACK_WORKSPACE_ROOTS);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Roots a shell tree snapshot must never cover (`git add --all` of / or ~).
+ * Paths strictly under $HOME are rejected by default, unless explicitly covered
+ * by a declared clean workspace root in PI_ROLLBACK_WORKSPACE_ROOTS.
+ */
+export function unsafeSnapshotRoot(root: string, workspaceRoots: readonly string[] = []): boolean {
+  const absolute = canonicalizePath(root);
+  const home = canonicalizePath(homedir());
+  // agentDir and the other forbidden roots stay unsafe even if (incorrectly)
+  // handed in through workspaceRoots, so a misconfiguration can never
+  // re-enable a full `git add --all` of the home/agent tree.
+  if (isForbiddenSnapshotRoot(absolute, home)) return true;
+  if (isWithin(home, absolute)) {
+    return !workspaceRoots.some((allowed) => {
+      const canonical = canonicalizePath(allowed);
+      if (isForbiddenSnapshotRoot(canonical, home)) return false;
+      if (!existsSync(canonical)) return false;
+      return isWithin(canonical, absolute);
+    });
+  }
+  return false;
+}
+
+function addRoot(roots: Set<string>, root: string, workspaceRoots: readonly string[] = []): void {
   const absolute = resolve(root);
-  if (!existsSync(absolute) || unsafeSnapshotRoot(absolute)) return;
+  if (!existsSync(absolute) || unsafeSnapshotRoot(absolute, workspaceRoots)) return;
   for (const existing of roots) if (isWithin(existing, absolute)) return;
   for (const existing of [...roots]) if (isWithin(absolute, existing)) roots.delete(existing);
   roots.add(absolute);
@@ -816,6 +895,14 @@ type AppliedState =
  * journaled `after`/`before` state is NOT equivalent: out-of-band edits made
  * after the mutation was recorded would be silently discarded.
  */
+function preflightFileMutations(selected: readonly Mutation[], side: "before" | "after", sandboxed: boolean, cwd: string, blobRoot?: string): void {
+  for (const mutation of selected) {
+    if (mutation.kind !== "file") continue;
+    if (sandboxed && !isWithin(cwd, mutation.path)) throw new Error(`Sandbox rollback refused external path: ${mutation.path}`);
+    verifyRestoreFileState(mutation.path, mutation[side], blobRoot);
+  }
+}
+
 async function applyMutation(pi: ExtensionAPI, mutation: Mutation, side: "before" | "after", sandboxed: boolean, cwd: string, blobRoot?: string): Promise<{ files: number; undo?: AppliedState }> {
   if (mutation.kind === "file") {
     if (sandboxed && !isWithin(cwd, mutation.path)) throw new Error(`Sandbox rollback refused external path: ${mutation.path}`);
@@ -868,6 +955,7 @@ export interface RollbackExtensionOptions {
   blobRoot?: string;
   pruneSettingsPath?: string;
   pruneEnv?: NodeJS.ProcessEnv;
+  workspaceRoots?: string[];
 }
 
 export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExtensionOptions = {}): void {
@@ -875,7 +963,11 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   const deepTracking = process.env.PI_ROLLBACK_DEEP_TRACKING === "1";
   const guardDestructive = process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE !== "0" && process.env.PI_ROLLBACK_GUARD_DESTRUCTIVE !== "false";
   const normalLayoutRoot = options.normalLayoutRoot ?? SNAPSHOT_ROOT;
-  const pruneSettings = readPruneSettings(options.pruneSettingsPath ?? join(getAgentDir(), "settings.json"));
+  const settingsPath = options.pruneSettingsPath ?? join(getAgentDir(), "settings.json");
+  const workspaceRoots = options.workspaceRoots
+    ? parseWorkspaceRoots(options.workspaceRoots)
+    : readWorkspaceRoots(settingsPath, options.pruneEnv?.PI_ROLLBACK_WORKSPACE_ROOTS !== undefined ? options.pruneEnv : process.env);
+  const pruneSettings = readPruneSettings(settingsPath);
   const pruneConfig: PruneConfig = pruneSettings.warning
     ? { ...parsePruneConfig({ PI_ROLLBACK_PRUNE: "0" }), warning: pruneSettings.warning }
     : parsePruneConfig(options.pruneEnv ?? process.env, pruneSettings.settings);
@@ -1058,7 +1150,14 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
           // Pi started in $HOME or / would make the baseline a `git add --all`
           // of the whole home directory: it times out after 30s on every guarded
           // turn. Keep the conversation checkpoint, skip the tree baseline.
-          if (unsafeSnapshotRoot(root)) {
+          if (unsafeSnapshotRoot(root, workspaceRoots)) {
+            // Tree snapshot is refused to keep snapshot size bounded, but still
+            // pre-snapshot statically resolvable file targets via lightweight blobs.
+            for (const hint of bashFileMutationHints(command, ctx.cwd)) {
+              const target = canonicalMutationPath(hint, ctx.cwd);
+              if (existsSync(target) && !lstatSync(target).isFile()) continue;
+              if (!pendingFiles.has(target)) pendingFiles.set(target, { path: target, before: captureFileState(target, options.blobRoot) });
+            }
             if (!unsafeRootWarned) {
               unsafeRootWarned = true;
               notify(ctx, `Rollback destructive guard: ${root} is too broad for a workspace snapshot; only the conversation checkpoint was saved`);
@@ -1075,13 +1174,24 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         }
       }
       if (!isShell || !deepTracking) return;
+      // Layer A + C: scoped git tree snapshots only for safe / whitelisted workspace roots.
       const roots = new Set<string>();
-      addRoot(roots, ctx.cwd);
-      for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)));
+      addRoot(roots, ctx.cwd, workspaceRoots);
+      for (const hint of bashPathHints(command, ctx.cwd)) addRoot(roots, await projectRoot(pi, canonicalMutationPath(hint, ctx.cwd)), workspaceRoots);
       for (const root of roots) {
         if (pendingRoots.has(root)) continue;
         const storeBase = sessionStore(ctx.sessionManager.getSessionId(), normalLayoutRoot);
         pendingRoots.set(root, { root, before: await capture(pi, root, storeBase), storeBase });
+      }
+      // Layer B: for statically resolved file targets NOT already covered by a
+      // tree snapshot (e.g. inside an unwhitelisted $HOME subtree like ~/.pi/agent),
+      // pre-snapshot the exact files via lightweight content-addressed blobs (zero git objects).
+      const coveredRoots = new Set([...roots, ...pendingRoots.keys()]);
+      for (const hint of bashFileMutationHints(command, ctx.cwd)) {
+        const target = canonicalMutationPath(hint, ctx.cwd);
+        if ([...coveredRoots].some((root) => existsSync(root) && isWithin(root, target))) continue;
+        if (existsSync(target) && !lstatSync(target).isFile()) continue;
+        if (!pendingFiles.has(target)) pendingFiles.set(target, { path: target, before: captureFileState(target, options.blobRoot) });
       }
     } catch (error) {
       notify(ctx, `Rollback preflight skipped: ${String(error)}`);
@@ -1304,6 +1414,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
           createdAt: Date.now(),
         };
       } else {
+        preflightFileMutations(selected, "before", sandboxed, ctx.cwd, options.blobRoot);
         try {
           for (const mutation of selected) {
             const outcome = await applyMutation(pi, mutation, "before", sandboxed, ctx.cwd, options.blobRoot);
@@ -1407,6 +1518,7 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
         sandboxBefore = restored.before;
       } else {
         await assertRedoGuards(pi, redo, options.blobRoot);
+        preflightFileMutations(redo.mutations ?? [], "after", sandboxed, ctx.cwd, options.blobRoot);
         try {
           for (const mutation of redo.mutations ?? []) {
             const outcome = await applyMutation(pi, mutation, "after", sandboxed, ctx.cwd, options.blobRoot);

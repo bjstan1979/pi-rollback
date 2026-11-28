@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, win32 } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import rollbackExtension, {
   buildRestoreMenu,
   capture as captureSnapshot,
@@ -17,9 +17,11 @@ import rollbackExtension, {
   validateStagedPaths,
   sessionStore as sessionSnapshotStore,
   snapshotDir as snapshotDirectory,
+  parseWorkspaceRoots,
   unsafeSnapshotRoot,
 } from "./index.js";
 import {
+  bashFileMutationHints,
   bashPathHints,
   captureFileState as captureState,
   isDestructiveCommand,
@@ -143,7 +145,7 @@ function mockPi(): ExtensionAPI {
   return { exec } as ExtensionAPI;
 }
 
-function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; confirmValue?: boolean; inputValue?: string | undefined; noUI?: boolean; execImpl?: typeof exec } = {}) {
+function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boolean; guardDestructive?: boolean; workspaceRoots?: string[]; sendUserMessageError?: Error; pruneSettings?: Record<string, unknown>; selectChoice?: string | undefined; selectResolver?: (choices: string[]) => string | undefined; confirmValue?: boolean; inputValue?: string | undefined; noUI?: boolean; execImpl?: typeof exec } = {}) {
   cleanup.push(sessionStore("session-test"));
   const handlers: Record<string, (event: any, ctx: any) => Promise<any>> = {};
   const commands: Record<string, (args: string, ctx: any) => Promise<void>> = {};
@@ -245,6 +247,7 @@ function harness(cwd: string, options: { sandboxed?: boolean; deepTracking?: boo
       normalLayoutRoot: pruneRoot,
       blobRoot: testLayout("blobs"),
       pruneSettingsPath: join(pruneRoot, "settings.json"),
+      workspaceRoots: options.workspaceRoots,
     });
   } finally {
     if (oldMode === undefined) delete process.env.HCOM_WORKER_SANDBOX; else process.env.HCOM_WORKER_SANDBOX = oldMode;
@@ -782,8 +785,20 @@ test("write and edit journal @ mentions and ~/ paths the way Pi resolves them", 
 
 test("snapshot guard rejects the home directory and every subtree under it", () => {
   const home = realpathSync(homedir());
+  const agentDir = realpathSync(getAgentDir());
   assert.equal(unsafeSnapshotRoot(home), true, "home itself must never be a snapshot root");
   assert.equal(unsafeSnapshotRoot(join(home, ".pi", "agent")), true, "a home subtree must also be rejected");
+  assert.equal(unsafeSnapshotRoot(agentDir), true, "the Pi agent directory must never be a snapshot root");
+  assert.equal(
+    unsafeSnapshotRoot(agentDir, [agentDir]),
+    true,
+    "agentDir must stay unsafe even if explicitly allowlisted",
+  );
+  assert.deepEqual(
+    parseWorkspaceRoots([agentDir, join(agentDir, "extensions")]),
+    [],
+    "agentDir entries must be dropped from the whitelist",
+  );
   assert.equal(unsafeSnapshotRoot(join(home, "projects", "demo")), true, "a project under home must be rejected");
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-rollback-safe-root-")));
   cleanup.push(cwd);
@@ -1671,4 +1686,224 @@ test("redo does not replay a stale rollback ok note from before the redone rollb
   await run.commands.redo!("", run.ctx);
   const afterRedo = contextNote();
   assert.equal(afterRedo === undefined || !/Rollback ok/.test(afterRedo), true);
+});
+
+test("bashPathHints and bashFileMutationHints parse relative targets for sed -i, rm, mv, tee, and redirections conservatively", () => {
+  const cwd = "/work/proj";
+  assert.deepEqual(
+    bashPathHints("sed -i 's/foo/bar/g' src/a.ts sub/b.ts", cwd, "linux"),
+    ["/work/proj/src/a.ts", "/work/proj/sub/b.ts"],
+  );
+  assert.deepEqual(
+    bashFileMutationHints("sed -i '' -e 's/a/b/' config.json", cwd, "linux"),
+    ["/work/proj/config.json"],
+  );
+  assert.deepEqual(
+    bashPathHints("rm -rf build/ old.txt", cwd, "linux"),
+    ["/work/proj/build", "/work/proj/old.txt"],
+  );
+  assert.deepEqual(
+    bashFileMutationHints("mv a.txt renamed.txt", cwd, "linux"),
+    ["/work/proj/a.txt", "/work/proj/renamed.txt"],
+  );
+  assert.deepEqual(
+    bashFileMutationHints("printf hi > out.log && cat out.log | tee -a copy.log", cwd, "linux"),
+    ["/work/proj/out.log", "/work/proj/copy.log"],
+  );
+  assert.deepEqual(
+    bashFileMutationHints("truncate -s 0 data.json && dd if=/dev/zero of=img.bin bs=1k count=1", cwd, "linux"),
+    ["/work/proj/data.json", "/work/proj/img.bin"],
+  );
+  // Conservative: dynamic variables, globs, flags, non-mutating subcommands, and /dev/null are ignored.
+  assert.deepEqual(bashPathHints("rm -f $TARGET *.tmp && echo ok > /dev/null 2>&1", cwd, "linux"), []);
+  assert.deepEqual(bashPathHints("sed 's/a/b/' read-only.txt", cwd, "linux"), []);
+});
+
+test("workspace root whitelist allows declared subtrees under $HOME while always rejecting $HOME itself and unwhitelisted subtrees", () => {
+  const home = realpathSync(homedir());
+  const project = mkdtempSync(join(home, ".pi-rollback-ws-test-"));
+  const messy = mkdtempSync(join(home, ".pi-rollback-messy-test-"));
+  cleanup.push(project, messy);
+
+  // Even if $HOME or / is passed in PI_ROLLBACK_WORKSPACE_ROOTS, parseWorkspaceRoots and unsafeSnapshotRoot reject them.
+  const parsed = parseWorkspaceRoots([home, "/", "/dev", "relative/path", project]);
+  assert.deepEqual(parsed, [realpathSync(project)]);
+  assert.equal(unsafeSnapshotRoot(home, [home, project]), true, "$HOME itself must never be allowed");
+  assert.equal(unsafeSnapshotRoot("/", ["/", project]), true, "filesystem root must never be allowed");
+  assert.equal(
+    unsafeSnapshotRoot(realpathSync(getAgentDir()), [realpathSync(getAgentDir()), project]),
+    true,
+    "agentDir must stay unsafe even when allowlisted",
+  );
+  assert.equal(unsafeSnapshotRoot(project, parsed), false, "whitelisted workspace root under $HOME is allowed");
+  assert.equal(unsafeSnapshotRoot(join(project, "src"), parsed), false, "subdirectory of whitelisted workspace root is allowed");
+  assert.equal(unsafeSnapshotRoot(messy, parsed), true, "unwhitelisted $HOME subtree stays rejected");
+});
+
+test("whitelisted workspace root under $HOME restores bash mutations byte-for-byte on rollback", async () => {
+  const home = realpathSync(homedir());
+  const project = mkdtempSync(join(home, ".pi-rollback-ws-e2e-"));
+  cleanup.push(project);
+  const file = join(project, "app.ts");
+  const generated = join(project, "generated.txt");
+  writeFileSync(file, "export const version = 1;\n");
+
+  const run = harness(project, { deepTracking: true, workspaceRoots: [project] });
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "python3 gen.py" } }, run.ctx);
+  writeFileSync(file, "export const version = 999;\n");
+  writeFileSync(generated, "script output\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), true);
+  await run.commands.rollback!("turn 1", run.ctx);
+  assert.equal(readFileSync(file, "utf8"), "export const version = 1;\n");
+  assert.equal(existsSync(generated), false);
+});
+
+test("unwhitelisted $HOME subtree creates zero git tree snapshots while still recovering statically resolved file mutations via blobs", async () => {
+  const home = realpathSync(homedir());
+  const messy = mkdtempSync(join(home, ".pi-rollback-home-mixed-"));
+  cleanup.push(messy);
+  const fileA = join(messy, "config.json");
+  const fileB = join(messy, "remove-me.txt");
+  const created = join(messy, "out.log");
+  writeFileSync(fileA, "{\"mode\":\"safe\"}\n");
+  writeFileSync(fileB, "precious\n");
+
+  const run = harness(messy, { deepTracking: true });
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "sed -i 's/safe/broken/' config.json && echo hi > out.log" } }, run.ctx);
+  writeFileSync(fileA, "{\"mode\":\"broken\"}\n");
+  writeFileSync(created, "hi\n");
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -f remove-me.txt" } }, run.ctx);
+  rmSync(fileB);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  // Bounded size guarantee: NO git tree snapshot (and no git objects dir) created for unwhitelisted $HOME subtree.
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), false);
+  const storeForSession = sessionSnapshotStore("session-test", run.pruneRoot);
+  assert.equal(existsSync(join(snapshotDir(messy, storeForSession), "objects")), false);
+
+  // Yet statically resolved file targets are recovered byte-for-byte via lightweight per-file blobs.
+  await run.commands.rollback!("turn 1", run.ctx);
+  assert.equal(readFileSync(fileA, "utf8"), "{\"mode\":\"safe\"}\n");
+  assert.equal(readFileSync(fileB, "utf8"), "precious\n");
+  assert.equal(existsSync(created), false);
+});
+
+test("destructive guard in an unwhitelisted $HOME subtree recovers statically resolved file deletions without a git tree snapshot", async () => {
+  const home = realpathSync(homedir());
+  const messy = mkdtempSync(join(home, ".pi-rollback-guard-home-"));
+  cleanup.push(messy);
+  const precious = join(messy, "notes.md");
+  writeFileSync(precious, "keep me\n");
+
+  const run = harness(messy); // default: deepTracking OFF, guardDestructive ON
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "bash", input: { command: "rm -f notes.md" } }, run.ctx);
+  rmSync(precious);
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), false);
+  const storeForSession = sessionSnapshotStore("session-test", run.pruneRoot);
+  assert.equal(existsSync(join(snapshotDir(messy, storeForSession), "objects")), false);
+
+  await run.commands.rollback!("destructive", run.ctx);
+  assert.equal(readFileSync(precious, "utf8"), "keep me\n");
+});
+
+test("restoreFileState removes broken symlinks for missing state and storeBlob self-heals truncated blobs", async () => {
+  const { symlinkSync } = await import("node:fs");
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-reliability-"));
+  const blobRoot = mkdtempSync(join(tmpdir(), "pi-rollback-blobs-heal-"));
+  cleanup.push(cwd, blobRoot);
+
+  // 1. Broken symlink is removed when restoring missing state.
+  const broken = join(cwd, "dangling-link");
+  symlinkSync(join(cwd, "does-not-exist"), broken);
+  restoreState(broken, { kind: "missing" }, blobRoot);
+  assert.throws(() => statSync(broken));
+  assert.equal(existsSync(broken), false);
+
+  // 2. A 0-byte truncated blob left by an interrupted write is healed on re-capture.
+  const file = join(cwd, "important.txt");
+  writeFileSync(file, "critical data\n");
+  const first = captureState(file, blobRoot);
+  assert.equal(first.kind, "file");
+  const bPath = join(blobRoot, first.blob.slice(0, 2), first.blob.slice(2));
+  writeFileSync(bPath, ""); // simulate crash-truncated 0-byte blob
+  assert.equal(statSync(bPath).size, 0);
+  // Force re-capture (modify file mtime/content then restore original)
+  writeFileSync(file, "temp\n");
+  captureState(file, blobRoot);
+  writeFileSync(file, "critical data\n");
+  captureState(file, blobRoot);
+  assert.equal(statSync(bPath).size, Buffer.byteLength("critical data\n"));
+  writeFileSync(file, "corrupted\n");
+  restoreState(file, first, blobRoot);
+  assert.equal(readFileSync(file, "utf8"), "critical data\n");
+});
+
+test("rollback preflight aborts before touching any file when a later mutation target is a directory", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-preflight-"));
+  cleanup.push(cwd, sessionStore("session-test"), snapshotDir(cwd, sessionStore("session-test")));
+  const fileA = join(cwd, "a.txt");
+  const fileB = join(cwd, "b.txt");
+  writeFileSync(fileA, "A-v0\n");
+  writeFileSync(fileB, "B-v0\n");
+
+  const run = harness(cwd);
+  await run.handlers.agent_start!({}, run.ctx);
+  await run.handlers.turn_start!({ turnIndex: 0 }, run.ctx);
+  await run.handlers.tool_call!({ toolName: "write", input: { path: "a.txt" } }, run.ctx);
+  writeFileSync(fileA, "A-v1\n");
+  await run.handlers.tool_call!({ toolName: "write", input: { path: "b.txt" } }, run.ctx);
+  writeFileSync(fileB, "B-v1\n");
+  await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
+
+  // Replace fileA with a directory before rolling back; preflight must fail before fileB is touched.
+  rmSync(fileA);
+  mkdirSync(fileA);
+  await run.commands.rollback!("turn 1", run.ctx);
+  const res = run.emitted.at(-1)!.data as { ok: boolean; error?: string };
+  assert.equal(res.ok, false);
+  assert.match(res.error ?? "", /Refusing to replace directory/);
+  assert.equal(readFileSync(fileB, "utf8"), "B-v1\n");
+});
+
+test("bashFileMutationHints tracks cd before file commands and mv/cp into existing directories", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-cd-mv-"));
+  cleanup.push(cwd);
+  const sub = join(cwd, "sub");
+  const backup = join(cwd, "backup");
+  mkdirSync(sub, { recursive: true });
+  mkdirSync(backup, { recursive: true });
+
+  assert.deepEqual(
+    bashFileMutationHints("cd sub && sed -i 's/a/b/' target.ts", cwd, "linux"),
+    [join(cwd, "sub", "target.ts")],
+  );
+  // A failed `cd` (||) leaves sed running in the ORIGINAL cwd; never predict sub/t.ts.
+  assert.deepEqual(
+    bashFileMutationHints("cd sub || sed -i 's/a/b/' target.ts", cwd, "linux"),
+    [join(cwd, "target.ts")],
+    "cd must not propagate across || (sed runs in cwd when cd fails)",
+  );
+  assert.deepEqual(
+    bashFileMutationHints("cd sub && git -C inner rm -f x.txt", cwd, "linux"),
+    [join(cwd, "sub", "inner", "x.txt")],
+    "git -C operands must resolve against the effective cwd",
+  );
+  assert.deepEqual(
+    bashFileMutationHints("mv a.txt backup", cwd, "linux"),
+    [join(cwd, "a.txt"), join(cwd, "backup", "a.txt")],
+  );
+  assert.deepEqual(
+    bashFileMutationHints("cp a.txt backup", cwd, "linux"),
+    [join(cwd, "backup", "a.txt")],
+  );
 });

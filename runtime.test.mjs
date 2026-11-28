@@ -49,12 +49,12 @@ export default function probe(pi: any) {
 }
 `;
 
-async function loadRollback(t, { deepTracking = false } = {}) {
-	const work = await mkdtemp(join(tmpdir(), "pi-rb-work-"));
+async function loadRollback(t, { deepTracking = false, work: customWork } = {}) {
+	const work = customWork ?? await mkdtemp(join(tmpdir(), "pi-rb-work-"));
 	const layout = await mkdtemp(join(tmpdir(), "pi-rb-layout-"));
 	const blobs = await mkdtemp(join(tmpdir(), "pi-rb-blobs-"));
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-rb-agent-"));
-	const probePath = join(work, ".rollback-probe.ts");
+	const probePath = join(customWork ? agentDir : work, ".rollback-probe.ts");
 	await writeFile(probePath, PROBE);
 	const previous = {
 		agentDir: process.env.PI_CODING_AGENT_DIR,
@@ -79,7 +79,7 @@ async function loadRollback(t, { deepTracking = false } = {}) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
-		for (const dir of [work, layout, blobs, agentDir]) await rm(dir, { recursive: true, force: true });
+		for (const dir of [...(customWork ? [] : [work]), layout, blobs, agentDir]) await rm(dir, { recursive: true, force: true });
 	});
 
 	const branch = [];
@@ -547,6 +547,54 @@ test("journal: mutation paths, destructive detection, and shell hints stay conse
 	}
 
 	const hints = journal.bashPathHints("cd sub && git -C repo status", cwd, "linux");
-	assert.deepEqual(hints, [join(cwd, "sub"), join(cwd, "repo")]);
+	// `git -C` is relative to the effective cwd after a successful `cd`.
+	assert.deepEqual(hints, [join(cwd, "sub"), join(cwd, "sub", "repo")]);
 	assert.deepEqual(journal.bashPathHints("rm -rf /", cwd, "linux"), [], "filesystem root is never hinted");
+});
+
+test("workspace whitelist and relative bash hints work through the real extension loader", async (t) => {
+	const { homedir } = await import("node:os");
+	const { existsSync } = await import("node:fs");
+	const home = homedir();
+	const project = await mkdtemp(join(home, ".pi-rb-rt-ws-"));
+	const messy = await mkdtemp(join(home, ".pi-rb-rt-messy-"));
+	t.after(async () => {
+		await rm(project, { recursive: true, force: true });
+		await rm(messy, { recursive: true, force: true });
+	});
+
+	const prevWs = process.env.PI_ROLLBACK_WORKSPACE_ROOTS;
+	process.env.PI_ROLLBACK_WORKSPACE_ROOTS = project;
+	t.after(() => {
+		if (prevWs === undefined) delete process.env.PI_ROLLBACK_WORKSPACE_ROOTS;
+		else process.env.PI_ROLLBACK_WORKSPACE_ROOTS = prevWs;
+	});
+
+	// 1. Whitelisted workspace root under $HOME: full bash mutation (even opaque script) rolls back.
+	const projFile = join(project, "app.txt");
+	await writeFile(projFile, "v1\n");
+	const h1 = await loadRollback(t, { deepTracking: true, work: project });
+	await h1.emit("agent_start", {});
+	await h1.emit("turn_start", { turnIndex: 0 });
+	await h1.emit("tool_call", { toolName: "bash", input: { command: "python3 build.py" } });
+	await writeFile(projFile, "v2\n");
+	await h1.emit("turn_end", { turnIndex: 0 });
+	assert.equal(h1.branch.some((e) => e.customType === "pi-rollback-mutation" && e.data?.kind === "root"), true);
+	await h1.runCommand("rollback", "turn 1");
+	assert.equal(await readFile(projFile, "utf8"), "v1\n");
+
+	// 2. Unwhitelisted $HOME subtree: no root snapshot (bounded size), yet relative sed -i rolls back via blob.
+	const messyFile = join(messy, "data.txt");
+	await writeFile(messyFile, "safe\n");
+	const h2 = await loadRollback(t, { deepTracking: true, work: messy });
+	await h2.emit("agent_start", {});
+	await h2.emit("turn_start", { turnIndex: 0 });
+	await h2.emit("tool_call", { toolName: "bash", input: { command: "sed -i 's/safe/oops/' data.txt" } });
+	await writeFile(messyFile, "oops\n");
+	await h2.emit("turn_end", { turnIndex: 0 });
+	assert.equal(h2.branch.some((e) => e.customType === "pi-rollback-mutation" && e.data?.kind === "root"), false);
+	assert.equal(h2.branch.some((e) => e.customType === "pi-rollback-mutation" && e.data?.kind === "file"), true);
+	assert.equal(existsSync(join(h2.layout, "sessions")), false);
+	await h2.runCommand("rollback", "turn 1");
+	assert.equal(await readFile(messyFile, "utf8"), "safe\n");
 });
