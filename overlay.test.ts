@@ -33,6 +33,30 @@ test("parseOverlayEnabled defaults to true on Linux and honors env > settings", 
   assert.equal(parseOverlayEnabled(settings, { PI_ROLLBACK_OVERLAY_BASH: "0" }), false);
 });
 
+test("overlay namespace points uid 0 passwd home at the real user home", async (t) => {
+  if (!isOverlaySupported()) {
+    t.skip("unprivileged OverlayFS not supported on this host");
+    return;
+  }
+  const base = process.env.HOME && process.env.HOME.startsWith("/") ? process.env.HOME : homedir();
+  const cwd = mkdtempSync(join(base, ".pi-rb-ovl-passwd-"));
+  cleanup.push(cwd);
+  const expected = process.env.HOME && process.env.HOME.startsWith("/") ? process.env.HOME : homedir();
+  const chunks: string[] = [];
+  const res = await execInOverlay("getent passwd 0", cwd, {
+    onData: (b) => chunks.push(b.toString("utf8")),
+    env: { ...process.env, BASH_ENV: "", HOME: expected },
+  });
+  try {
+    assert.equal(res.mounted, true);
+    assert.equal(res.exitCode, 0);
+    assert.equal(chunks.join("").trim().split(":")[5], expected);
+    assert.notEqual(expected, "/root");
+  } finally {
+    res.cleanup();
+  }
+});
+
 test("canUseOverlayForCwd rejects /, system paths, and directories containing tmpdir", () => {
   assert.equal(canUseOverlayForCwd("/"), false);
   assert.equal(canUseOverlayForCwd("/dev"), false);

@@ -36,7 +36,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   BLOB_ROOT,
@@ -194,12 +194,14 @@ export function canUseOverlayForCwd(cwd: string, tempParent: string = tmpdir()):
 }
 
 // Bootstrap script executed inside `unshare -rm`.
-// Args: $1=mountOpts $2=lower $3=origBind $4=upper $5=deletedList $6=mountedMarker $7=shellPath $8=command
+// Args: $1=mountOpts $2=lower $3=origBind $4=upper $5=deletedList $6=mountedMarker $7=shellPath $8=command $9=realHome
 // 1. Bind-mounts untouched lowerdir at $origBind.
 // 2. Mounts OverlayFS directly over $lower so pwd and absolute paths under cwd stay identical.
 // 3. Touches $mountedMarker so caller knows the command actually entered the overlay.
-// 4. Runs the user's command and captures its exit code.
-// 5. For any directory present in $upper (including opaque dirs from `rm -rf d && mkdir d`),
+// 4. Points uid 0's passwd home at the real user home. unshare -r is required to mount
+//    overlay, but getpwuid(0) must not send ssh and similar tools to /root.
+// 5. Runs the user's command and captures its exit code.
+// 6. For any directory present in $upper (including opaque dirs from `rm -rf d && mkdir d`),
 //    records entries that existed in $origBind but vanished from $lower into $deletedList (NUL-delimited).
 const OVERLAY_BOOTSTRAP = `
 mount --bind "$2" "$3" || exit 125
@@ -207,6 +209,18 @@ mount -t overlay overlay -o "$1" "$2" || exit 125
 cd -P "$2" || exit 125
 export PWD="$2"
 : > "$6"
+real_home="$HOME"
+if [ -z "$real_home" ]; then real_home="$9"; fi
+passwd_overlay=""
+if [ -n "$real_home" ] && [ -f /etc/passwd ]; then
+  passwd_overlay=$(mktemp)
+  if awk -F: -v home="$real_home" 'BEGIN{OFS=":"} $3==0 {$6=home} {print}' /etc/passwd > "$passwd_overlay" && mount --bind "$passwd_overlay" /etc/passwd; then
+    :
+  else
+    rm -f "$passwd_overlay"
+    passwd_overlay=""
+  fi
+fi
 "$7" -c "$8"
 ec=$?
 find "$4" -type d -print0 2>/dev/null | while IFS= read -r -d '' udir; do
@@ -232,6 +246,7 @@ find "$4" -type d -print0 2>/dev/null | while IFS= read -r -d '' udir; do
     fi
   done
 done
+if [ -n "$passwd_overlay" ]; then rm -f "$passwd_overlay"; fi
 exit "$ec"
 `;
 
@@ -262,7 +277,7 @@ export async function execInOverlay(
   const exitCode = await new Promise<number | null>((resolvePromise, rejectPromise) => {
     const child = spawn(
       "unshare",
-      ["-rm", "bash", "-c", OVERLAY_BOOTSTRAP, "_", mountOpts, lower, origDir, upperDir, deletedList, mountedMarker, actualShell, command],
+      ["-rm", "bash", "-c", OVERLAY_BOOTSTRAP, "_", mountOpts, lower, origDir, upperDir, deletedList, mountedMarker, actualShell, command, homedir()],
       {
         cwd: lower,
         env: { ...(options.env ?? process.env), PWD: lower },
