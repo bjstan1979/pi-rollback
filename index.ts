@@ -790,11 +790,11 @@ async function projectRoot(pi: ExtensionAPI, path: string): Promise<string> {
 }
 
 /** Roots a deep-tracking shell snapshot must never cover (`git add --all` of / or ~). */
-function unsafeSnapshotRoot(root: string): boolean {
+export function unsafeSnapshotRoot(root: string): boolean {
   const absolute = resolve(root);
   if (dirname(absolute) === absolute) return true;
   const home = homedir();
-  if (absolute === resolve(home) || isWithin(absolute, resolve(home))) return true;
+  if (absolute === resolve(home) || isWithin(resolve(home), absolute)) return true;
   return isNonWorkspacePath(absolute);
 }
 

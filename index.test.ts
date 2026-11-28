@@ -17,6 +17,7 @@ import rollbackExtension, {
   validateStagedPaths,
   sessionStore as sessionSnapshotStore,
   snapshotDir as snapshotDirectory,
+  unsafeSnapshotRoot,
 } from "./index.js";
 import {
   bashPathHints,
@@ -777,6 +778,16 @@ test("write and edit journal @ mentions and ~/ paths the way Pi resolves them", 
   assert.deepEqual(mutationPaths("edit", { path: "@literal.txt" }, cwd, false), [literal]);
   // ts_morph is not a Pi write/edit path and must keep the literal spelling.
   assert.deepEqual(mutationPaths("ts_morph", { filePath: "@src/app.ts" }, cwd, false), [join(cwd, "@src", "app.ts")]);
+});
+
+test("snapshot guard rejects the home directory and every subtree under it", () => {
+  const home = realpathSync(homedir());
+  assert.equal(unsafeSnapshotRoot(home), true, "home itself must never be a snapshot root");
+  assert.equal(unsafeSnapshotRoot(join(home, ".pi", "agent")), true, "a home subtree must also be rejected");
+  assert.equal(unsafeSnapshotRoot(join(home, "projects", "demo")), true, "a project under home must be rejected");
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "pi-rollback-safe-root-")));
+  cleanup.push(cwd);
+  assert.equal(unsafeSnapshotRoot(cwd), false, "a normal workspace outside home stays snapshot-eligible");
 });
 
 test("path hints include quoted POSIX and Windows absolute arguments", () => {
