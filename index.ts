@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type BashOperations, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   bashFileMutationHints,
@@ -37,6 +38,13 @@ import {
   type PruneConfig,
   type PruneReport,
 } from "./prune.js";
+import {
+  canUseOverlayForCwd,
+  commitOverlay,
+  execInOverlay,
+  isOverlaySupported,
+  parseOverlayEnabled,
+} from "./overlay.js";
 
 const CHECKPOINT_TYPE = "pi-rollback-checkpoint";
 const MUTATION_TYPE = "pi-rollback-mutation";
@@ -810,12 +818,32 @@ function expandWorkspaceEntry(raw: string): string {
  * PI_ROLLBACK_WORKSPACE_ROOTS: `/`, `$HOME` itself, system pseudo-paths, and
  * the Pi agent directory (which is full of nested git repos and snapshots).
  */
+function isCanonicalWithin(parent: string, child: string): boolean {
+  const scoped = relative(parent, child);
+  return scoped === "" || (!scoped.startsWith("..") && !isAbsolute(scoped));
+}
+
 function isForbiddenSnapshotRoot(canonical: string, home: string): boolean {
   if (dirname(canonical) === canonical) return true;
   if (canonical === home) return true;
   if (isNonWorkspacePath(canonical)) return true;
-  const agentDir = canonicalizePath(getAgentDir());
-  if (canonical === agentDir || isWithin(agentDir, canonical)) return true;
+  const protectedDirs = new Set<string>([
+    canonicalizePath(join(homedir(), ".pi", "agent")),
+    canonicalizePath(SNAPSHOT_ROOT),
+  ]);
+  try {
+    const activeAgentDir = getAgentDir();
+    if (activeAgentDir) protectedDirs.add(canonicalizePath(activeAgentDir));
+  } catch {}
+  if (process.env.PI_CODING_AGENT_DIR) {
+    const expanded = expandWorkspaceEntry(process.env.PI_CODING_AGENT_DIR);
+    if (expanded && isAbsolute(expanded)) protectedDirs.add(canonicalizePath(expanded));
+  }
+  for (const dir of protectedDirs) {
+    // Reject the agent/snapshot dir itself, any descendant inside it, AND any
+    // ancestor that would swallow it (e.g. ~/.pi). Pure path check avoids ENOENT.
+    if (isCanonicalWithin(dir, canonical) || isCanonicalWithin(canonical, dir)) return true;
+  }
   return false;
 }
 
@@ -956,6 +984,7 @@ export interface RollbackExtensionOptions {
   pruneSettingsPath?: string;
   pruneEnv?: NodeJS.ProcessEnv;
   workspaceRoots?: string[];
+  overlayBash?: boolean;
 }
 
 export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExtensionOptions = {}): void {
@@ -967,6 +996,10 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
   const workspaceRoots = options.workspaceRoots
     ? parseWorkspaceRoots(options.workspaceRoots)
     : readWorkspaceRoots(settingsPath, options.pruneEnv?.PI_ROLLBACK_WORKSPACE_ROOTS !== undefined ? options.pruneEnv : process.env);
+  const overlayEnabled = options.overlayBash !== undefined
+    ? options.overlayBash
+    : parseOverlayEnabled(settingsPath, options.pruneEnv?.PI_ROLLBACK_OVERLAY_BASH !== undefined ? options.pruneEnv : process.env);
+  const overlayActive = !sandboxed && overlayEnabled && isOverlaySupported();
   const pruneSettings = readPruneSettings(settingsPath);
   const pruneConfig: PruneConfig = pruneSettings.warning
     ? { ...parsePruneConfig({ PI_ROLLBACK_PRUNE: "0" }), warning: pruneSettings.warning }
@@ -1759,4 +1792,74 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
       };
     },
   });
+
+  // Transactional OverlayFS bash wrapper (default on Linux when unprivileged OverlayFS is supported).
+  // Captures 100% of file creations, edits, renames, and deletions under cwd at O(changed bytes)
+  // with full rollback, while the whitelist + single-file blob path remains the safe fallback.
+  const createBashDef = (piCodingAgent as Record<string, unknown>).createBashToolDefinition as
+    | typeof piCodingAgent.createBashToolDefinition
+    | undefined;
+  const createLocalBashOps = (piCodingAgent as Record<string, unknown>).createLocalBashOperations as
+    | typeof piCodingAgent.createLocalBashOperations
+    | undefined;
+  if (overlayActive && typeof createBashDef === "function" && typeof createLocalBashOps === "function") {
+    pi.registerTool({
+      ...createBashDef(process.cwd()),
+      async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+        const effectiveCwd = ctx.cwd || process.cwd();
+        if (!canUseOverlayForCwd(effectiveCwd)) {
+          return createBashDef(effectiveCwd).execute(toolCallId, params, signal, onUpdate, ctx);
+        }
+        const localOps = createLocalBashOps();
+        const overlayOps: BashOperations = {
+          exec: async (command, execCwd, execOpts) => {
+            if (!canUseOverlayForCwd(execCwd)) return localOps.exec(command, execCwd, execOpts);
+            let ovl;
+            try {
+              ovl = await execInOverlay(command, execCwd, {
+                onData: execOpts.onData,
+                signal: execOpts.signal,
+                timeout: execOpts.timeout,
+                env: execOpts.env,
+              });
+            } catch {
+              return localOps.exec(command, execCwd, execOpts);
+            }
+            try {
+              if (!ovl.mounted && !ovl.aborted && !ovl.timedOut) {
+                // Mount failed before the user command ran: fall back cleanly.
+                // A timed-out command may have already run partially, so never
+                // re-execute it locally even if the mount marker was not written.
+                return localOps.exec(command, execCwd, execOpts);
+              }
+              if (ovl.aborted || ovl.timedOut) {
+                // Transactional abort (explicit cancel or timeout): discard upperdir,
+                // leave lowerdir untouched. A timed-out command is not a completed
+                // transaction, so never commit its partial upperdir writes.
+                return { exitCode: ovl.exitCode };
+              }
+              const canonicalCwd = existsSync(execCwd) ? realpathSync(execCwd) : resolve(execCwd);
+              // OverlayFS handles exact diffing for this cwd; drop redundant root pre-snapshot.
+              pendingRoots.delete(canonicalCwd);
+              const { changes, touchedPaths } = commitOverlay(canonicalCwd, ovl.upperDir, ovl.deletedRelPaths, options.blobRoot);
+              for (const p of touchedPaths) pendingFiles.delete(p);
+              for (const change of changes) {
+                appendMutation(pi, ctx, {
+                  kind: "file",
+                  path: change.path,
+                  before: change.before,
+                  after: change.after,
+                  source: "tool",
+                });
+              }
+              return { exitCode: ovl.exitCode };
+            } finally {
+              ovl.cleanup();
+            }
+          },
+        };
+        return createBashDef(effectiveCwd, { operations: overlayOps }).execute(toolCallId, params, signal, onUpdate, ctx);
+      },
+    } as any);
+  }
 }

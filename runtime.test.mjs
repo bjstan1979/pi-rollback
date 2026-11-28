@@ -130,6 +130,7 @@ async function loadRollback(t, { deepTracking = false, work: customWork } = {}) 
 			getEntries: () => branch,
 			getLeafId: () => leafId,
 			getSessionId: () => "session-a",
+			getSessionFile: () => undefined,
 		},
 		waitForIdle: async () => {},
 		navigateTree: async (entryId, options) => {
@@ -597,4 +598,45 @@ test("workspace whitelist and relative bash hints work through the real extensio
 	assert.equal(existsSync(join(h2.layout, "sessions")), false);
 	await h2.runCommand("rollback", "turn 1");
 	assert.equal(await readFile(messyFile, "utf8"), "safe\n");
+});
+
+test("OverlayFS bash tool captures opaque mutations in unwhitelisted $HOME subtree with zero git objects and rolls back", async (t) => {
+	const { homedir } = await import("node:os");
+	const home = homedir();
+	const messy = await mkdtemp(join(home, ".pi-rb-rt-ovl-"));
+	t.after(async () => {
+		await rm(messy, { recursive: true, force: true });
+	});
+
+	const origFile = join(messy, "config.json");
+	const subDir = join(messy, "cache");
+	await mkdir(subDir, { recursive: true });
+	await writeFile(origFile, '{"v":1}\n');
+	await writeFile(join(subDir, "item.txt"), "cached\n");
+
+	const prevBashEnv = process.env.BASH_ENV;
+	delete process.env.BASH_ENV;
+	t.after(() => { if (prevBashEnv !== undefined) process.env.BASH_ENV = prevBashEnv; });
+	const h = await loadRollback(t, { deepTracking: false, work: messy });
+	if (!h.extension.tools.has("bash")) {
+		t.skip("unprivileged OverlayFS not supported on this host");
+		return;
+	}
+	await h.emit("agent_start", {});
+	await h.emit("turn_start", { turnIndex: 0 });
+	await h.runTool("bash", {
+		command: String.raw`python3 -c 'import pathlib; pathlib.Path("config.json").write_text("{\"v\":999}\n"); pathlib.Path("gen.txt").write_text("hi\n")' && rm -rf cache`,
+	});
+	await h.emit("turn_end", { turnIndex: 0 });
+
+	assert.equal(h.branch.some((e) => e.customType === "pi-rollback-mutation" && e.data?.kind === "root"), false);
+	assert.equal(existsSync(join(h.layout, "sessions")), false);
+	assert.equal(await readFile(origFile, "utf8"), '{"v":999}\n');
+	assert.equal(await readFile(join(messy, "gen.txt"), "utf8"), "hi\n");
+	assert.equal(existsSync(join(subDir, "item.txt")), false);
+
+	await h.runCommand("rollback", "turn 1");
+	assert.equal(await readFile(origFile, "utf8"), '{"v":1}\n');
+	assert.equal(existsSync(join(messy, "gen.txt")), false);
+	assert.equal(await readFile(join(subDir, "item.txt"), "utf8"), "cached\n");
 });

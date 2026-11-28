@@ -9,9 +9,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
@@ -21,7 +23,8 @@ export const BLOB_ROOT = join(homedir(), ".pi", "agent", "rollback-snapshots", "
 
 export type FileState =
   | { kind: "missing" }
-  | { kind: "file"; blob: string; mode: number };
+  | { kind: "file"; blob: string; mode: number }
+  | { kind: "symlink"; target: string };
 
 function blobPath(blob: string, blobRoot = BLOB_ROOT): string {
   return join(blobRoot, blob.slice(0, 2), blob.slice(2));
@@ -111,9 +114,14 @@ export function isHcomSandbox(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 export function captureFileState(path: string, blobRoot = BLOB_ROOT): FileState {
-  if (!existsSync(path)) return { kind: "missing" };
-  const stat = lstatSync(path);
-  if (!stat.isFile()) throw new Error(`Rollback supports regular files only: ${path}`);
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return { kind: "missing" };
+  }
+  if (stat.isSymbolicLink()) return { kind: "symlink", target: readlinkSync(path) };
+  if (!stat.isFile()) throw new Error(`Rollback supports regular files and symlinks only: ${path}`);
   const mode = stat.mode & 0o777;
   const key = `${blobRoot}\0${path}`;
   const memo = statMemo.get(key);
@@ -134,7 +142,10 @@ export function captureFileState(path: string, blobRoot = BLOB_ROOT): FileState 
 }
 
 export function sameFileState(a: FileState, b: FileState): boolean {
-  return a.kind === b.kind && (a.kind === "missing" || (b.kind === "file" && a.blob === b.blob && a.mode === b.mode));
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "missing") return true;
+  if (a.kind === "symlink") return b.kind === "symlink" && a.target === b.target;
+  return b.kind === "file" && a.blob === b.blob && a.mode === b.mode;
 }
 
 /**
@@ -148,6 +159,10 @@ export function verifyRestoreFileState(path: string, state: FileState, blobRoot 
   } catch {}
   if (state.kind === "missing") {
     if (existing?.isDirectory()) throw new Error(`Refusing to remove directory for missing file state: ${path}`);
+    return;
+  }
+  if (state.kind === "symlink") {
+    if (existing?.isDirectory()) throw new Error(`Refusing to replace directory with a restored symlink: ${path}`);
     return;
   }
   if (existing?.isDirectory()) {
@@ -166,6 +181,19 @@ export function restoreFileState(path: string, state: FileState, blobRoot = BLOB
     if (existing) {
       if (existing.isDirectory()) throw new Error(`Refusing to remove directory for missing file state: ${path}`);
       rmSync(path, { force: true });
+    }
+    return;
+  }
+  if (state.kind === "symlink") {
+    if (existing?.isDirectory()) throw new Error(`Refusing to replace directory with a restored symlink: ${path}`);
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = join(dirname(path), `.${basename(path)}.pi-rollback-${process.pid}-${randomUUID()}`);
+    try {
+      symlinkSync(state.target, temporary);
+      renameSync(temporary, path);
+    } catch (error) {
+      try { rmSync(temporary, { force: true }); } catch {}
+      throw error;
     }
     return;
   }
@@ -468,19 +496,59 @@ function parseBashHints(command: string, cwd: string, platform: string): { all: 
     }
 
     if (cmd === "git") {
-      let gitBase: string | undefined;
-      for (let i = 0; i + 1 < args.length; i += 1) {
-        if (args[i]!.value === "-C") {
-          gitBase = addHint(args[i + 1]!.value, false, effectiveCwd);
-          i += 1;
+      let gitCwd = effectiveCwd;
+      let sawC = false;
+      let subIdx = 0;
+      const gitOptsWithArg = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
+      while (subIdx < args.length) {
+        const v = args[subIdx]!.value;
+        if (v === "-C" && subIdx + 1 < args.length) {
+          const base = gitCwd;
+          const dir = addHint(args[subIdx + 1]!.value, false, base);
+          if (dir) gitCwd = dir;
+          sawC = true;
+          subIdx += 2;
+          continue;
         }
+        if (gitOptsWithArg.has(v) && subIdx + 1 < args.length) {
+          subIdx += 2;
+          continue;
+        }
+        if (v.startsWith("-")) {
+          subIdx += 1;
+          continue;
+        }
+        break;
       }
-      // `git -C <dir> rm/unlink ...` operates on files relative to <dir>.
-      // Resolve those operands against gitBase so they are journaled correctly.
-      const sub = args.find((w) => w.kind === "word" && ["rm", "mv", "cp"].includes(w.value.toLowerCase()));
-      if (gitBase && sub) {
-        const subIdx = args.indexOf(sub);
-        for (const op of collectOperands(args.slice(subIdx + 1))) addHint(op, true, gitBase);
+      if (subIdx < args.length) {
+        const subCmd = args[subIdx]!.value;
+        const subArgs = args.slice(subIdx + 1);
+        if (subCmd === "rm") {
+          const skipWorktree = subArgs.some((t) => t.value === "--cached" || t.value === "-n" || t.value === "--dry-run");
+          if (!skipWorktree) {
+            for (const op of collectOperands(subArgs)) addHint(op, true, gitCwd);
+          }
+        } else if (subCmd === "mv") {
+          const dryRun = subArgs.some((t) => t.value === "-n" || t.value === "--dry-run");
+          if (!dryRun) {
+            const operands = collectOperands(subArgs);
+            if (operands.length >= 2) {
+              const last = operands.at(-1)!;
+              const resolvedLast = resolveShellPath(last, gitCwd, platform);
+              const destIsDir = resolvedLast !== undefined && existsSync(resolvedLast) && lstatSync(resolvedLast).isDirectory();
+              if (destIsDir && resolvedLast) {
+                all.add(resolvedLast);
+                for (let i = 0; i < operands.length - 1; i += 1) {
+                  const src = operands[i]!;
+                  addHint(src, true, gitCwd);
+                  addHint(join(resolvedLast, basename(src)), true, gitCwd);
+                }
+              } else {
+                for (const op of operands) addHint(op, true, gitCwd);
+              }
+            }
+          }
+        }
       }
       continue;
     }

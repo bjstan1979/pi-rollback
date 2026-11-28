@@ -1026,7 +1026,7 @@ test("registers mutation hooks and commands", () => {
   const run = harness(cwd);
   assert.deepEqual(Object.keys(run.handlers), ["tool_call", "session_start", "session_shutdown", "agent_start", "turn_start", "turn_end", "context", "agent_settled"]);
   assert.deepEqual(Object.keys(run.commands), ["checkpoint", "checkpoints", "rollback-prune", "rollback", "redo"]);
-  assert.deepEqual(run.tools, ["checkpoint", "rollback"]);
+  assert.deepEqual(run.tools, ["checkpoint", "rollback", "bash"]);
 });
 test("global settings can disable pruning without environment variables", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rollback-settings-"));
@@ -1906,4 +1906,36 @@ test("bashFileMutationHints tracks cd before file commands and mv/cp into existi
     bashFileMutationHints("cp a.txt backup", cwd, "linux"),
     [join(cwd, "backup", "a.txt")],
   );
+});
+
+test("audit regressions: ~/.pi ancestor rejected, non-existent agentDir safe, and git rm/mv subcommand parsing stays exact", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-rb-audit-"));
+  try {
+    mkdirSync(join(root, "a", "b"), { recursive: true });
+    // ~/.pi is an ancestor of agentDir and must be hard-rejected from whitelist.
+    const piDir = join(homedir(), ".pi");
+    assert.deepEqual(parseWorkspaceRoots([piDir]), []);
+    assert.equal(unsafeSnapshotRoot(piDir, [piDir]), true);
+
+    // Non-existent PI_CODING_AGENT_DIR must not throw ENOENT in isForbiddenSnapshotRoot.
+    const missingAgent = join(root, "nonexistent-agent-dir");
+    const prevAgent = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = missingAgent;
+    try {
+      assert.deepEqual(parseWorkspaceRoots([missingAgent]), []);
+      assert.equal(unsafeSnapshotRoot(missingAgent, [missingAgent]), true);
+      assert.equal(unsafeSnapshotRoot(join(root, "a"), []), false);
+    } finally {
+      if (prevAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prevAgent;
+    }
+
+    // Plain `git rm`, chained `git -C a -C b rm`, and non-mutating `git commit -m mv` / `git rm --cached`.
+    assert.deepEqual(bashFileMutationHints("git rm -f x.txt", root, "linux"), [join(root, "x.txt")]);
+    assert.deepEqual(bashFileMutationHints("git -C a -C b rm -f x.txt", root, "linux"), [join(root, "a", "b", "x.txt")]);
+    assert.deepEqual(bashFileMutationHints("git -C a commit -m mv foo.txt", root, "linux"), []);
+    assert.deepEqual(bashFileMutationHints("git -C a rm --cached x.txt", root, "linux"), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
