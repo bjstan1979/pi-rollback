@@ -1186,14 +1186,19 @@ export default function rollbackExtension(pi: ExtensionAPI, options: RollbackExt
           if (unsafeSnapshotRoot(root, workspaceRoots)) {
             // Tree snapshot is refused to keep snapshot size bounded, but still
             // pre-snapshot statically resolvable file targets via lightweight blobs.
+            let blobTargets = 0;
             for (const hint of bashFileMutationHints(command, ctx.cwd)) {
               const target = canonicalMutationPath(hint, ctx.cwd);
               if (existsSync(target) && !lstatSync(target).isFile()) continue;
               if (!pendingFiles.has(target)) pendingFiles.set(target, { path: target, before: captureFileState(target, options.blobRoot) });
+              blobTargets += 1;
             }
             if (!unsafeRootWarned) {
               unsafeRootWarned = true;
-              notify(ctx, `Rollback destructive guard: ${root} is too broad for a workspace snapshot; only the conversation checkpoint was saved`);
+              const detail = blobTargets > 0
+                ? `a conversation checkpoint was saved and ${blobTargets} statically resolvable file target${blobTargets === 1 ? " was" : "s were"} pre-snapshotted as single-file blob${blobTargets === 1 ? "" : "s"}`
+                : "no workspace tree snapshot was taken and no file targets were statically resolvable; a conversation checkpoint was saved";
+              notify(ctx, `Rollback destructive guard: ${root} is too broad for a workspace snapshot; ${detail}`);
             }
           } else if (!pendingRoots.has(root)) {
             const storeBase = sessionStore(ctx.sessionManager.getSessionId(), normalLayoutRoot);

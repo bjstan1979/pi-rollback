@@ -1808,6 +1808,13 @@ test("destructive guard in an unwhitelisted $HOME subtree recovers statically re
   rmSync(precious);
   await run.handlers.turn_end!({ turnIndex: 0 }, run.ctx);
 
+  // Guard warning must state the real protection: tree snapshot skipped, but the
+  // statically resolved rm target was pre-snapshotted as a single-file blob.
+  const guardNote = run.notifications.find((n) => n.includes("too broad for a workspace snapshot"));
+  assert.ok(guardNote, "expected the unsafe-root guard warning");
+  assert.match(guardNote, /1 statically resolvable file target was pre-snapshotted as single-file blob/);
+  assert.doesNotMatch(guardNote, /only the conversation checkpoint/);
+
   assert.equal(run.entries.some((entry) => entry.data?.kind === "root"), false);
   const storeForSession = sessionSnapshotStore("session-test", run.pruneRoot);
   assert.equal(existsSync(join(snapshotDir(messy, storeForSession), "objects")), false);
