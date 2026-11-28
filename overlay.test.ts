@@ -1,6 +1,6 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,8 @@ import {
   execInOverlay,
   isOverlaySupported,
   parseOverlayEnabled,
+  prepareSshConfigDropins,
+  probeOverlaySupport,
 } from "./overlay.js";
 import { captureFileState, restoreFileState } from "./journal.js";
 
@@ -33,25 +35,85 @@ test("parseOverlayEnabled defaults to true on Linux and honors env > settings", 
   assert.equal(parseOverlayEnabled(settings, { PI_ROLLBACK_OVERLAY_BASH: "0" }), false);
 });
 
-test("overlay namespace points uid 0 passwd home at the real user home", async (t) => {
+test("probeOverlaySupport reports structured diagnostic for two-namespace OverlayFS", () => {
+  const result = probeOverlaySupport(true);
+  if (result.supported) {
+    assert.equal(result.reason, "ok");
+  } else {
+    assert.notEqual(result.reason, "ok");
+  }
+  assert.equal(isOverlaySupported(), result.supported);
+});
+
+test("OverlayFS two-namespace execution preserves real host uid/gid, zero CapEff, passwd home, upper ownership, and opaque rollback", async (t) => {
   if (!isOverlaySupported()) {
-    t.skip("unprivileged OverlayFS not supported on this host");
+    t.skip("unprivileged two-namespace OverlayFS not supported on this host");
     return;
   }
-  const base = process.env.HOME && process.env.HOME.startsWith("/") ? process.env.HOME : homedir();
-  const cwd = mkdtempSync(join(base, ".pi-rb-ovl-passwd-"));
-  cleanup.push(cwd);
-  const expected = process.env.HOME && process.env.HOME.startsWith("/") ? process.env.HOME : homedir();
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  assert.equal(typeof hostUid, "number");
+  assert.equal(typeof hostGid, "number");
+
+  const home = realpathSync(homedir());
+  const cwd = mkdtempSync(join(home, ".pi-rb-ovl-twons-"));
+  const blobRoot = mkdtempSync(join(tmpdir(), "pi-rb-ovl-twons-blobs-"));
+  cleanup.push(cwd, blobRoot);
+
+  mkdirSync(join(cwd, "sub"), { recursive: true });
+  writeFileSync(join(cwd, "a.txt"), "before\n");
+  writeFileSync(join(cwd, "sub", "old.txt"), "old-sub\n");
+
   const chunks: string[] = [];
-  const res = await execInOverlay("getent passwd 0", cwd, {
-    onData: (b) => chunks.push(b.toString("utf8")),
-    env: { ...process.env, BASH_ENV: "", HOME: expected },
-  });
+  const res = await execInOverlay(
+    [
+      'echo "UID=$(id -u)"',
+      'echo "GID=$(id -g)"',
+      `echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status)"`,
+      'echo "PW_HOME=$(getent passwd "$(id -u)" | cut -d: -f6)"',
+      'echo "after" > a.txt',
+      'rm -rf sub && mkdir sub && echo "fresh" > sub/new.txt',
+    ].join(" && "),
+    cwd,
+    { onData: (b) => chunks.push(b.toString("utf8")), env: { ...process.env, BASH_ENV: "" } },
+  );
   try {
     assert.equal(res.mounted, true);
+    assert.equal(res.aborted, false);
+    assert.equal(res.timedOut, false);
     assert.equal(res.exitCode, 0);
-    assert.equal(chunks.join("").trim().split(":")[5], expected);
-    assert.notEqual(expected, "/root");
+
+    const out = Object.fromEntries(
+      chunks.join("").trim().split("\n").map((line) => {
+        const i = line.indexOf("=");
+        return [line.slice(0, i), line.slice(i + 1)];
+      }),
+    );
+    assert.equal(out.UID, String(hostUid), "inner process must run as real host uid, not uid 0");
+    assert.equal(out.GID, String(hostGid), "inner process must run as real host gid");
+    assert.equal(out.CAPEFF, "0000000000000000", "inner process must have zero effective capabilities");
+    assert.equal(out.PW_HOME, homedir(), "getent passwd $(id -u) must resolve to real user home");
+    if (hostUid !== 0) assert.notEqual(out.PW_HOME, "/root");
+
+    // Host upperdir files must be owned by real host uid/gid, while lowerdir stays untouched pre-commit.
+    const upperStat = lstatSync(join(res.upperDir, "a.txt"));
+    assert.equal(upperStat.uid, hostUid);
+    assert.equal(upperStat.gid, hostGid);
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "before\n");
+    assert.equal(readFileSync(join(cwd, "sub", "old.txt"), "utf8"), "old-sub\n");
+
+    // Commit and verify byte-for-byte rollback including opaque directory replacement.
+    const { changes } = commitOverlay(cwd, res.upperDir, res.deletedRelPaths, blobRoot);
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "after\n");
+    assert.equal(existsSync(join(cwd, "sub", "old.txt")), false);
+    assert.equal(readFileSync(join(cwd, "sub", "new.txt"), "utf8"), "fresh\n");
+
+    for (const change of [...changes].reverse()) {
+      restoreFileState(change.path, change.before, blobRoot);
+    }
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "before\n");
+    assert.equal(readFileSync(join(cwd, "sub", "old.txt"), "utf8"), "old-sub\n");
+    assert.equal(existsSync(join(cwd, "sub", "new.txt")), false);
   } finally {
     res.cleanup();
   }
@@ -250,4 +312,125 @@ test("OverlayFS replacing a symlink with a regular file captures the symlink and
     rmSync(dir, { recursive: true, force: true });
     rmSync(blobs, { recursive: true, force: true });
   }
+});
+
+test("OverlayFS two-namespace ssh -G succeeds with real known_hosts and user-owned ssh_config.d drop-ins", async (t) => {
+  if (!isOverlaySupported()) {
+    t.skip("unprivileged two-namespace OverlayFS not supported on this host");
+    return;
+  }
+  if (!existsSync("/usr/bin/ssh")) {
+    t.skip("/usr/bin/ssh not installed on this host");
+    return;
+  }
+  const hostUid = process.getuid?.();
+  const cwd = mkdtempSync(join(tmpdir(), "pi-rb-ovl-ssh-"));
+  cleanup.push(cwd);
+  const chunks: string[] = [];
+  const res = await execInOverlay(
+    '/usr/bin/ssh -G localhost && for f in /etc/ssh/ssh_config.d/*.conf; do [ -e "$f" ] && stat -L -c "DROPIN_UID=%u" "$f"; done; true',
+    cwd,
+    { onData: (b) => chunks.push(b.toString("utf8")), env: { ...process.env, BASH_ENV: "" } },
+  );
+  try {
+    assert.equal(res.mounted, true);
+    assert.equal(res.exitCode, 0);
+    const output = chunks.join("");
+    assert.equal(/Bad owner or permissions/i.test(output), false);
+    assert.match(output, new RegExp(`userknownhostsfile\\s+${homedir().replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}/\\.ssh/known_hosts`));
+    for (const line of output.split("\n")) {
+      if (line.startsWith("DROPIN_UID=")) {
+        assert.equal(line.slice("DROPIN_UID=".length).trim(), String(hostUid));
+      }
+    }
+  } finally {
+    res.cleanup();
+    assert.equal(existsSync(res.baseDir), false);
+  }
+});
+
+test("prepareSshConfigDropins fails closed when any drop-in is unreadable (never binds partial config)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-rb-ssh-fc-"));
+  cleanup.push(dir);
+  const src = join(dir, "ssh_config.d");
+  const staged = join(dir, "staged");
+  mkdirSync(src, { recursive: true });
+  writeFileSync(join(src, "10-good.conf"), "SendEnv LANG\n", { mode: 0o644 });
+  const bad = join(src, "20-unreadable.conf");
+  writeFileSync(bad, "StrictHostKeyChecking yes\n", { mode: 0o600 });
+  chmodSync(bad, 0o000);
+  try {
+    // Only enforceable when not running as real root (root bypasses 0000 DAC checks).
+    if (process.getuid?.() === 0) return;
+    const res = prepareSshConfigDropins(src, staged);
+    assert.equal(res.status, "rejected");
+    assert.equal(res.count, 0);
+    assert.match(res.reason ?? "", /read failed/i);
+    assert.equal(existsSync(staged), false, "staging dir must not exist after fail-closed rejection");
+  } finally {
+    chmodSync(bad, 0o600);
+  }
+});
+
+test("prepareSshConfigDropins allows trusted symlinks, skips empty dir, and rejects escaping symlinks, devices, and oversized files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-rb-ssh-sym-"));
+  cleanup.push(dir);
+
+  // 1. Empty directory (WSL scenario): skipped-empty with zero staging overhead.
+  const emptySrc = join(dir, "empty");
+  const emptyStaged = join(dir, "empty-staged");
+  mkdirSync(emptySrc, { recursive: true });
+  assert.deepEqual(prepareSshConfigDropins(emptySrc, emptyStaged), { status: "skipped-empty", count: 0 });
+  assert.equal(existsSync(emptyStaged), false);
+
+  // 2. Trusted symlink (simulating 20-systemd-ssh-proxy.conf -> /usr/lib/systemd/ssh_config.d/...).
+  const trustedTargetDir = join(dir, "trusted-systemd");
+  const untrustedTargetDir = join(dir, "untrusted");
+  mkdirSync(trustedTargetDir, { recursive: true });
+  mkdirSync(untrustedTargetDir, { recursive: true });
+  const trustedConf = join(trustedTargetDir, "20-systemd-ssh-proxy.conf");
+  writeFileSync(trustedConf, "Host machine/*\n  ProxyCommand none\n", { mode: 0o644 });
+  const untrustedConf = join(untrustedTargetDir, "evil.conf");
+  writeFileSync(untrustedConf, "ProxyCommand evil\n", { mode: 0o644 });
+
+  const okSrc = join(dir, "ok-src");
+  const okStaged = join(dir, "ok-staged");
+  mkdirSync(okSrc, { recursive: true });
+  symlinkSync(trustedConf, join(okSrc, "20-systemd-ssh-proxy.conf"));
+  const okRes = prepareSshConfigDropins(okSrc, okStaged, [trustedTargetDir]);
+  assert.equal(okRes.status, "staged");
+  assert.equal(okRes.count, 1);
+  assert.equal(readFileSync(join(okStaged, "20-systemd-ssh-proxy.conf"), "utf8"), "Host machine/*\n  ProxyCommand none\n");
+  assert.equal(lstatSync(join(okStaged, "20-systemd-ssh-proxy.conf")).mode & 0o777, 0o644);
+
+  // 3. Escaping symlink outside allowed prefixes -> rejected (fail-closed).
+  const escSrc = join(dir, "esc-src");
+  const escStaged = join(dir, "esc-staged");
+  mkdirSync(escSrc, { recursive: true });
+  symlinkSync(trustedConf, join(escSrc, "10-ok.conf"));
+  symlinkSync(untrustedConf, join(escSrc, "20-evil.conf"));
+  const escRes = prepareSshConfigDropins(escSrc, escStaged, [trustedTargetDir]);
+  assert.equal(escRes.status, "rejected");
+  assert.match(escRes.reason ?? "", /outside allowed prefixes/i);
+  assert.equal(existsSync(escStaged), false);
+
+  // 4. Symlink to /dev/zero (non-regular device) -> rejected immediately without hanging.
+  const devSrc = join(dir, "dev-src");
+  const devStaged = join(dir, "dev-staged");
+  mkdirSync(devSrc, { recursive: true });
+  symlinkSync("/dev/zero", join(devSrc, "99-zero.conf"));
+  const devRes = prepareSshConfigDropins(devSrc, devStaged, ["/dev"]);
+  assert.equal(devRes.status, "rejected");
+  assert.match(devRes.reason ?? "", /not a regular file/i);
+  assert.equal(existsSync(devStaged), false);
+
+  // 5. Oversized file (>256 KiB) -> rejected.
+  const bigSrc = join(dir, "big-src");
+  const bigStaged = join(dir, "big-staged");
+  mkdirSync(bigSrc, { recursive: true });
+  writeFileSync(join(bigSrc, "huge.conf"), "a".repeat(300 * 1024));
+  const bigRes = prepareSshConfigDropins(bigSrc, bigStaged);
+  assert.equal(bigRes.status, "rejected");
+  assert.match(bigRes.reason ?? "", /exceeds/i);
+  assert.equal(existsSync(bigStaged), false);
 });

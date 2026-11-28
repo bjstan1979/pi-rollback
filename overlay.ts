@@ -33,10 +33,11 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   BLOB_ROOT,
@@ -62,6 +63,20 @@ export interface OverlayExecOptions {
   shellPath?: string;
 }
 
+export type SshConfigBindStatus =
+  | "skipped-empty"
+  | "bound"
+  | "rejected"
+  | "bind-failed"
+  | "remount-ro-failed";
+
+export interface SshConfigPrepResult {
+  status: "skipped-empty" | "staged" | "rejected";
+  count: number;
+  stagingDir?: string;
+  reason?: string;
+}
+
 export interface OverlayExecResult {
   exitCode: number | null;
   mounted: boolean;
@@ -70,10 +85,36 @@ export interface OverlayExecResult {
   baseDir: string;
   upperDir: string;
   deletedRelPaths: string[];
+  sshConfigStatus?: SshConfigBindStatus;
+  sshConfigDetail?: string;
   cleanup: () => void;
 }
 
-let cachedOverlaySupport: boolean | undefined;
+export type OverlayProbeReason =
+  | "ok"
+  | "non-linux"
+  | "no-host-uid-gid"
+  | "outer-unshare-denied"
+  | "outer-mount-failed"
+  | "inner-unshare-unsupported-flag"
+  | "inner-unshare-denied"
+  | "inner-write-failed"
+  | "probe-error";
+
+export interface OverlayProbeResult {
+  supported: boolean;
+  reason: OverlayProbeReason;
+  detail?: string;
+}
+
+let cachedProbeResult: OverlayProbeResult | undefined;
+
+function getHostUidGid(): { uid: number; gid: number } | undefined {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (typeof uid !== "number" || typeof gid !== "number") return undefined;
+  return { uid, gid };
+}
 
 /** Recursively restore write/search bits on `work/` (OverlayFS creates `work/work` with mode 0000). */
 function makeRemovable(dir: string): void {
@@ -98,47 +139,103 @@ export function cleanupOverlayDir(baseDir: string): void {
   } catch {}
 }
 
-/** Probe once per process whether unprivileged `unshare -rm` + OverlayFS works on this kernel. */
-export function isOverlaySupported(forceReprobe = false): boolean {
-  if (!forceReprobe && cachedOverlaySupport !== undefined) return cachedOverlaySupport;
+function isUsernsPermissionError(stderr: string): boolean {
+  return /uid_map|gid_map|operation not permitted|permission denied|不允许的操作|权限不够/i.test(stderr);
+}
+
+/**
+ * Probe once per process whether two-layer unprivileged OverlayFS works on this host:
+ *   1. Outer `unshare -rm` mounts OverlayFS (userns#1 uid 0 owns mntns#1).
+ *   2. Inner `unshare --user --map-user=<uid> --map-group=<gid>` inherits mntns#1
+ *      and writes as the real host uid/gid with zero root privileges.
+ * Distinguishes AppArmor/userns denial from kernel mount failure or old util-linux (< 2.38).
+ */
+export function probeOverlaySupport(forceReprobe = false): OverlayProbeResult {
+  if (!forceReprobe && cachedProbeResult !== undefined) return cachedProbeResult;
   if (process.platform !== "linux") {
-    cachedOverlaySupport = false;
-    return false;
+    cachedProbeResult = { supported: false, reason: "non-linux" };
+    return cachedProbeResult;
+  }
+  const host = getHostUidGid();
+  if (!host) {
+    cachedProbeResult = { supported: false, reason: "no-host-uid-gid" };
+    return cachedProbeResult;
   }
   const base = mkdtempSync(join(tmpdir(), "pi-rb-ovl-probe-"));
   try {
     const lower = join(base, "l");
     const upper = join(base, "u");
     const work = join(base, "w");
+    const mountedFlag = join(base, "mounted");
     mkdirSync(lower, { recursive: true });
     mkdirSync(upper, { recursive: true });
     mkdirSync(work, { recursive: true });
     writeFileSync(join(lower, "a"), "ok\n");
     const opts = `lowerdir=${lower},upperdir=${upper},workdir=${work},userxattr`;
+    const probeScript = [
+      'mount -t overlay overlay -o "$1" "$2" || exit 121',
+      'cd -P "$2" || exit 121',
+      ': > "$3"',
+      `unshare --user --map-user="$4" --map-group="$5" -- sh -c '[ "$(id -u)" = "$1" ] && [ "$(id -g)" = "$2" ] && echo new > a' _ "$4" "$5"`,
+    ].join("; ");
     const res = spawnSync(
       "unshare",
-      [
-        "-rm",
-        "sh",
-        "-c",
-        'mount -t overlay overlay -o "$1" "$2" && cd "$2" && echo new > a',
-        "_",
-        opts,
-        lower,
-      ],
-      { timeout: 5_000, stdio: "ignore" },
+      ["-rm", "sh", "-c", probeScript, "_", opts, lower, mountedFlag, String(host.uid), String(host.gid)],
+      { timeout: 5_000, encoding: "utf8" },
     );
-    cachedOverlaySupport = res.status === 0
-      && existsSync(join(upper, "a"))
-      && readFileSync(join(upper, "a"), "utf8").trim() === "new"
-      && readFileSync(join(lower, "a"), "utf8").trim() === "ok";
-    return cachedOverlaySupport;
-  } catch {
-    cachedOverlaySupport = false;
-    return false;
+    const stderr = (res.stderr ?? "").trim();
+    if (res.error) {
+      cachedProbeResult = { supported: false, reason: "probe-error", detail: res.error.message };
+      return cachedProbeResult;
+    }
+    const outerMounted = existsSync(mountedFlag);
+    if (!outerMounted) {
+      if (res.status === 121) {
+        cachedProbeResult = { supported: false, reason: "outer-mount-failed", detail: stderr || undefined };
+      } else {
+        cachedProbeResult = {
+          supported: false,
+          reason: isUsernsPermissionError(stderr) ? "outer-unshare-denied" : "outer-mount-failed",
+          detail: stderr || undefined,
+        };
+      }
+      return cachedProbeResult;
+    }
+    if (res.status !== 0) {
+      if (/unrecognized option|invalid option|--map-user|--map-group/i.test(stderr)) {
+        cachedProbeResult = { supported: false, reason: "inner-unshare-unsupported-flag", detail: stderr };
+      } else if (isUsernsPermissionError(stderr)) {
+        cachedProbeResult = { supported: false, reason: "inner-unshare-denied", detail: stderr };
+      } else {
+        cachedProbeResult = { supported: false, reason: "inner-write-failed", detail: stderr || undefined };
+      }
+      return cachedProbeResult;
+    }
+    const upperFile = join(upper, "a");
+    const ok = existsSync(upperFile)
+      && readFileSync(upperFile, "utf8").trim() === "new"
+      && readFileSync(join(lower, "a"), "utf8").trim() === "ok"
+      && lstatSync(upperFile).uid === host.uid
+      && lstatSync(upperFile).gid === host.gid;
+    cachedProbeResult = ok
+      ? { supported: true, reason: "ok" }
+      : { supported: false, reason: "inner-write-failed", detail: "upper file missing, content mismatch, or host uid/gid mismatch" };
+    return cachedProbeResult;
+  } catch (error) {
+    cachedProbeResult = {
+      supported: false,
+      reason: "probe-error",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+    return cachedProbeResult;
   } finally {
     cleanupOverlayDir(base);
   }
+}
+
+/** Probe once per process whether two-layer unprivileged OverlayFS works on this kernel. */
+export function isOverlaySupported(forceReprobe = false): boolean {
+  return probeOverlaySupport(forceReprobe).supported;
 }
 
 /**
@@ -193,35 +290,154 @@ export function canUseOverlayForCwd(cwd: string, tempParent: string = tmpdir()):
   return true;
 }
 
-// Bootstrap script executed inside `unshare -rm`.
-// Args: $1=mountOpts $2=lower $3=origBind $4=upper $5=deletedList $6=mountedMarker $7=shellPath $8=command $9=realHome
+const MAX_SSH_DROPIN_BYTES = 256 * 1024;
+const DEFAULT_ALLOWED_SSH_SYMLINK_PREFIXES = [
+  "/etc/ssh",
+  "/usr/lib/systemd/ssh_config.d",
+  "/lib/systemd/ssh_config.d",
+  "/usr/share/openssh",
+  "/run/ssh",
+  "/run/systemd",
+];
+
+function isPathUnderPrefix(target: string, prefix: string): boolean {
+  const rel = relative(prefix, target);
+  return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+}
+
+/**
+ * Stage `/etc/ssh/ssh_config.d/*.conf` as user-owned 0644 copies for read-only
+ * bind-mounting inside the overlay mount namespace.
+ *
+ * Security invariants (fail-closed):
+ * - Empty or missing source dir -> `skipped-empty` (zero mount overhead on WSL).
+ * - Every `*.conf` entry must validate and copy cleanly; if ANY entry is unreadable,
+ *   non-regular (FIFO/device/dir), oversized (>256 KiB), a broken symlink, or a
+ *   symlink escaping trusted system prefixes, staging is aborted and removed so ssh
+ *   never runs against a silently truncated policy set.
+ */
+export function prepareSshConfigDropins(
+  sourceDir: string,
+  stagingDir: string,
+  allowedSymlinkPrefixes: readonly string[] = DEFAULT_ALLOWED_SSH_SYMLINK_PREFIXES,
+): SshConfigPrepResult {
+  if (!existsSync(sourceDir)) return { status: "skipped-empty", count: 0 };
+  let srcStat: ReturnType<typeof lstatSync>;
+  try {
+    srcStat = statSync(sourceDir);
+  } catch (error) {
+    return { status: "rejected", count: 0, reason: `stat sourceDir failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!srcStat.isDirectory()) return { status: "skipped-empty", count: 0 };
+
+  let names: string[];
+  try {
+    names = readdirSync(sourceDir).filter((name) => name.endsWith(".conf")).sort();
+  } catch (error) {
+    return { status: "rejected", count: 0, reason: `readdir failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (names.length === 0) return { status: "skipped-empty", count: 0 };
+
+  const canonicalSource = realpathSync(sourceDir);
+  const canonicalPrefixes = new Set<string>([canonicalSource]);
+  for (const prefix of allowedSymlinkPrefixes) {
+    try {
+      canonicalPrefixes.add(existsSync(prefix) ? realpathSync(prefix) : resolve(prefix));
+    } catch {
+      canonicalPrefixes.add(resolve(prefix));
+    }
+  }
+
+  const stagedFiles: Array<{ name: string; content: Buffer }> = [];
+  for (const name of names) {
+    const entryPath = join(sourceDir, name);
+    let lst: ReturnType<typeof lstatSync>;
+    try {
+      lst = lstatSync(entryPath);
+    } catch (error) {
+      return { status: "rejected", count: 0, reason: `lstat failed on ${name}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+
+    let resolvedPath = entryPath;
+    if (lst.isSymbolicLink()) {
+      try {
+        resolvedPath = realpathSync(entryPath);
+      } catch {
+        return { status: "rejected", count: 0, reason: `broken symlink: ${name}` };
+      }
+      const allowed = [...canonicalPrefixes].some((prefix) => isPathUnderPrefix(resolvedPath, prefix));
+      if (!allowed) {
+        return { status: "rejected", count: 0, reason: `symlink target outside allowed prefixes: ${name} -> ${resolvedPath}` };
+      }
+    } else if (!lst.isFile()) {
+      return { status: "rejected", count: 0, reason: `non-regular drop-in entry: ${name}` };
+    }
+
+    let targetStat: ReturnType<typeof statSync>;
+    try {
+      targetStat = statSync(resolvedPath);
+    } catch (error) {
+      return { status: "rejected", count: 0, reason: `stat target failed on ${name}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!targetStat.isFile()) {
+      return { status: "rejected", count: 0, reason: `target is not a regular file: ${name} -> ${resolvedPath}` };
+    }
+    if (targetStat.size > MAX_SSH_DROPIN_BYTES) {
+      return { status: "rejected", count: 0, reason: `drop-in exceeds ${MAX_SSH_DROPIN_BYTES} bytes: ${name} (${targetStat.size})` };
+    }
+
+    try {
+      const content = readFileSync(resolvedPath);
+      if (content.length > MAX_SSH_DROPIN_BYTES) {
+        return { status: "rejected", count: 0, reason: `drop-in read exceeds ${MAX_SSH_DROPIN_BYTES} bytes: ${name}` };
+      }
+      stagedFiles.push({ name, content });
+    } catch (error) {
+      return { status: "rejected", count: 0, reason: `read failed on ${name}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  try {
+    mkdirSync(stagingDir, { recursive: true, mode: 0o755 });
+    chmodSync(stagingDir, 0o755);
+    for (const file of stagedFiles) {
+      const dest = join(stagingDir, file.name);
+      writeFileSync(dest, file.content, { mode: 0o644 });
+      chmodSync(dest, 0o644);
+    }
+    return { status: "staged", count: stagedFiles.length, stagingDir };
+  } catch (error) {
+    try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+    return { status: "rejected", count: 0, reason: `stage write failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+// Bootstrap script executed inside outer `unshare -rm` (userns#1 uid 0 owning mntns#1).
+// Args: $1=mountOpts $2=lower $3=origBind $4=upper $5=deletedList $6=mountedMarker $7=shellPath $8=command $9=hostUid ${10}=hostGid ${11}=sshStagedDir ${12}=sshDiagFile
 // 1. Bind-mounts untouched lowerdir at $origBind.
 // 2. Mounts OverlayFS directly over $lower so pwd and absolute paths under cwd stay identical.
-// 3. Touches $mountedMarker so caller knows the command actually entered the overlay.
-// 4. Points uid 0's passwd home at the real user home. unshare -r is required to mount
-//    overlay, but getpwuid(0) must not send ssh and similar tools to /root.
-// 5. Runs the user's command and captures its exit code.
-// 6. For any directory present in $upper (including opaque dirs from `rm -rf d && mkdir d`),
-//    records entries that existed in $origBind but vanished from $lower into $deletedList (NUL-delimited).
+// 3. Enters an inner user namespace (`unshare --user --map-user=$9 --map-group=${10}`, WITHOUT `-m`)
+//    that inherits mntns#1 with identity mapping back to the real host uid/gid and zero root caps.
+//    Touches $mountedMarker right inside the inner namespace before `exec`ing the user's shell,
+//    so caller only marks `mounted=true` once both namespaces and the overlay are active.
+// 4. After the inner command exits, outer userns#1 (still holding mntns#1) scans directories in
+//    $upper (including opaque dirs from `rm -rf d && mkdir d`) and records vanished entries into
+//    $deletedList (NUL-delimited).
 const OVERLAY_BOOTSTRAP = `
 mount --bind "$2" "$3" || exit 125
 mount -t overlay overlay -o "$1" "$2" || exit 125
 cd -P "$2" || exit 125
 export PWD="$2"
-: > "$6"
-real_home="$HOME"
-if [ -z "$real_home" ]; then real_home="$9"; fi
-passwd_overlay=""
-if [ -n "$real_home" ] && [ -f /etc/passwd ]; then
-  passwd_overlay=$(mktemp)
-  if awk -F: -v home="$real_home" 'BEGIN{OFS=":"} $3==0 {$6=home} {print}' /etc/passwd > "$passwd_overlay" && mount --bind "$passwd_overlay" /etc/passwd; then
-    :
+if [ -n "\${11}" ] && [ -d /etc/ssh/ssh_config.d ]; then
+  if ssh_err=$(mount --bind "\${11}" /etc/ssh/ssh_config.d 2>&1); then
+    if ! ssh_ro_err=$(mount -o remount,ro,bind /etc/ssh/ssh_config.d 2>&1); then
+      printf 'remount-ro-failed:%s\n' "$ssh_ro_err" > "\${12}"
+    fi
   else
-    rm -f "$passwd_overlay"
-    passwd_overlay=""
+    printf 'bind-failed:%s\n' "$ssh_err" > "\${12}"
   fi
 fi
-"$7" -c "$8"
+unshare --user --map-user="$9" --map-group="\${10}" -- sh -c ': > "$1" || exit 125; exec "$2" -c "$3"' _ "$6" "$7" "$8"
 ec=$?
 find "$4" -type d -print0 2>/dev/null | while IFS= read -r -d '' udir; do
   rel="\${udir#"$4"}"
@@ -246,7 +462,6 @@ find "$4" -type d -print0 2>/dev/null | while IFS= read -r -d '' udir; do
     fi
   done
 done
-if [ -n "$passwd_overlay" ]; then rm -f "$passwd_overlay"; fi
 exit "$ec"
 `;
 
@@ -263,6 +478,10 @@ export async function execInOverlay(
   const origDir = join(baseDir, "orig");
   const deletedList = join(baseDir, "deleted.nul");
   const mountedMarker = join(baseDir, "mounted");
+  const sshConfigDir = join(baseDir, "ssh_config.d");
+  const sshDiagFile = join(baseDir, "ssh-bind.diag");
+  const sshPrep = prepareSshConfigDropins("/etc/ssh/ssh_config.d", sshConfigDir);
+  const sshBindArg = sshPrep.status === "staged" ? sshConfigDir : "";
   mkdirSync(upperDir, { recursive: true });
   mkdirSync(workDir, { recursive: true });
   mkdirSync(origDir, { recursive: true });
@@ -274,10 +493,34 @@ export async function execInOverlay(
   let aborted = false;
   let timedOut = false;
 
+  const host = getHostUidGid();
+  if (!host) {
+    cleanupOverlayDir(baseDir);
+    throw new Error("Host uid/gid unavailable for two-namespace OverlayFS execution");
+  }
+
   const exitCode = await new Promise<number | null>((resolvePromise, rejectPromise) => {
     const child = spawn(
       "unshare",
-      ["-rm", "bash", "-c", OVERLAY_BOOTSTRAP, "_", mountOpts, lower, origDir, upperDir, deletedList, mountedMarker, actualShell, command, homedir()],
+      [
+        "-rm",
+        "bash",
+        "-c",
+        OVERLAY_BOOTSTRAP,
+        "_",
+        mountOpts,
+        lower,
+        origDir,
+        upperDir,
+        deletedList,
+        mountedMarker,
+        actualShell,
+        command,
+        String(host.uid),
+        String(host.gid),
+        sshBindArg,
+        sshDiagFile,
+      ],
       {
         cwd: lower,
         env: { ...(options.env ?? process.env), PWD: lower },
@@ -342,6 +585,26 @@ export async function execInOverlay(
     } catch {}
   }
 
+  let sshConfigStatus: SshConfigBindStatus;
+  let sshConfigDetail: string | undefined;
+  if (sshPrep.status === "skipped-empty") {
+    sshConfigStatus = "skipped-empty";
+  } else if (sshPrep.status === "rejected") {
+    sshConfigStatus = "rejected";
+    sshConfigDetail = sshPrep.reason;
+  } else if (existsSync(sshDiagFile)) {
+    const diag = readFileSync(sshDiagFile, "utf8").trim();
+    if (diag.startsWith("remount-ro-failed:")) {
+      sshConfigStatus = "remount-ro-failed";
+      sshConfigDetail = diag.slice("remount-ro-failed:".length).trim();
+    } else {
+      sshConfigStatus = "bind-failed";
+      sshConfigDetail = diag.replace(/^bind-failed:/, "").trim();
+    }
+  } else {
+    sshConfigStatus = "bound";
+  }
+
   return {
     exitCode,
     mounted: existsSync(mountedMarker),
@@ -350,6 +613,8 @@ export async function execInOverlay(
     baseDir,
     upperDir,
     deletedRelPaths,
+    sshConfigStatus,
+    sshConfigDetail,
     cleanup: () => cleanupOverlayDir(baseDir),
   };
 }
